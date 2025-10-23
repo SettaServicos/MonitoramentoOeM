@@ -231,7 +231,7 @@ def main():
     api = PVOperationAPI(os.getenv("EMAIL"), os.getenv("PASSWORD"))
     _teams_post_card(
         title=f"⚠ Teste de aplicacao no servidor",
-        text=msg.replace("\n", "  \n"),
+        text="teste do servidor",
         severity="danger",
         facts=[("Capacidade", f"10000000 kWp")]
     )
