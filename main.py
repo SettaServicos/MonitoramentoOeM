@@ -228,13 +228,10 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
 # =====================================
 def main():
     logger.info("Iniciando varredura automática...")
-    api = PVOperationAPI(os.getenv("EMAIL"), os.getenv("PASSWORD"))
-    _teams_post_card(
-        title=f"⚠ Teste de aplicacao no servidor",
-        text="teste do servidor",
-        severity="danger",
-        facts=[("Capacidade", f"10000000 kWp")]
-    )
+    
+    email = os.getenv("EMAIL")
+    password = os.getenv("PASSWORD")
+    api = PVOperationAPI(email, password)
 
     plantas = api.get_plants()
     if not plantas:
