@@ -264,7 +264,7 @@ def main():
 
     agora = datetime.now()
     # Janela móvel de 25 minutos (tolerância para cron atrasado)
-    inicio_janela = agora - timedelta(minutes=25)
+    inicio_janela = agora - timedelta(minutes=30)
     ultimo_alerta = get_last_alert_time()
     logger.info(f"Analisando período entre {inicio_janela} e {agora}")
 
