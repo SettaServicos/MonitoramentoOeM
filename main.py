@@ -239,7 +239,7 @@ def main():
         return
 
     agora = datetime.now()
-    inicio_janela = datetime.combine(agora.date(), datetime.min.time())
+    inicio_janela = agora - timedelta(minutes=25)
 
     for p in plantas:
         usina_id = str(p.get("id"))
