@@ -224,11 +224,35 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
     return falhas
 
 # =====================================
-# EXECUÇÃO AUTOMÁTICA
+# UTILITÁRIOS PARA EVITAR DUPLICAÇÕES
+# =====================================
+LAST_ALERT_FILE = "last_alert.json"
+
+def get_last_alert_time():
+    """Lê o último timestamp de alerta salvo."""
+    if os.path.exists(LAST_ALERT_FILE):
+        try:
+            with open(LAST_ALERT_FILE) as f:
+                data = json.load(f)
+                return datetime.fromisoformat(data.get("last_ts"))
+        except Exception:
+            pass
+    return datetime.min
+
+def update_last_alert_time(ts: datetime):
+    """Atualiza o timestamp do último alerta."""
+    try:
+        with open(LAST_ALERT_FILE, "w") as f:
+            json.dump({"last_ts": ts.isoformat()}, f)
+    except Exception as e:
+        logger.warning(f"Não foi possível salvar timestamp de alerta: {e}")
+
+# =====================================
+# EXECUÇÃO AUTOMÁTICA (ATUALIZADA)
 # =====================================
 def main():
     logger.info("Iniciando varredura automática...")
-    
+
     email = os.getenv("EMAIL")
     password = os.getenv("PASSWORD")
     api = PVOperationAPI(email, password)
@@ -239,7 +263,10 @@ def main():
         return
 
     agora = datetime.now()
+    # Janela móvel de 25 minutos (tolerância para cron atrasado)
     inicio_janela = agora - timedelta(minutes=25)
+    ultimo_alerta = get_last_alert_time()
+    logger.info(f"Analisando período entre {inicio_janela} e {agora}")
 
     for p in plantas:
         usina_id = str(p.get("id"))
@@ -249,10 +276,17 @@ def main():
 
         # RELÉS
         alertas = detectar_alertas_rele(api, usina_id, inicio_janela, agora)
-        if alertas:
-            a = alertas[0]
-            msg = (f"⚠ Alerta de Relé ({a['tipo_alerta']})\nUsina: {nome}\nRelé: {a['rele_id']}\n"
-                   f"Horário: {a['ts_leitura']}\nParâmetros: {a['parametros']}")
+        for a in alertas:
+            if a["ts_leitura"] <= ultimo_alerta:
+                continue  # já enviado antes
+
+            msg = (
+                f"⚠ Alerta de Relé ({a['tipo_alerta']})\n"
+                f"Usina: {nome}\n"
+                f"Relé: {a['rele_id']}\n"
+                f"Horário: {a['ts_leitura']}\n"
+                f"Parâmetros: {a['parametros']}"
+            )
             logger.warning(msg)
             _teams_post_card(
                 title=f"⚠ Alerta de Relé ({a['tipo_alerta']})",
@@ -260,20 +294,30 @@ def main():
                 severity="danger",
                 facts=[("Capacidade", f"{cap} kWp")]
             )
-            continue  # prioridade: não processa inversores nesta usina
+            update_last_alert_time(a["ts_leitura"])
+            break  # prioridade: não processa inversores nesta usina
 
-        # INVERSORES
-        falhas = detectar_falhas_inversores(api, usina_id, inicio_janela, agora)
-        for f in falhas:
-            msg = (f"⚠ Falha de Inversor\nUsina: {nome}\nInversor: {f['inversor_id']}\n"
-                   f"Horário: {f['ts_leitura']}\nPac: {f['pac']}")
-            logger.warning(msg)
-            _teams_post_card(
-                title="⚠ Falha de Inversor (Pac=0 por 3 leituras consecutivas)",
-                text=msg.replace("\n", "  \n"),
-                severity="danger",
-                facts=[("Capacidade", f"{cap} kWp")]
-            )
+        else:  # só roda inversores se não houve alerta de relé
+            falhas = detectar_falhas_inversores(api, usina_id, inicio_janela, agora)
+            for f in falhas:
+                if f["ts_leitura"] <= ultimo_alerta:
+                    continue  # já enviado antes
+
+                msg = (
+                    f"⚠ Falha de Inversor\n"
+                    f"Usina: {nome}\n"
+                    f"Inversor: {f['inversor_id']}\n"
+                    f"Horário: {f['ts_leitura']}\n"
+                    f"Pac: {f['pac']}"
+                )
+                logger.warning(msg)
+                _teams_post_card(
+                    title="⚠ Falha de Inversor (Pac=0 por 3 leituras consecutivas)",
+                    text=msg.replace("\n", "  \n"),
+                    severity="danger",
+                    facts=[("Capacidade", f"{cap} kWp")]
+                )
+                update_last_alert_time(f["ts_leitura"])
 
     logger.info("Varredura concluída com sucesso.")
     print("✅ Concluído.")
