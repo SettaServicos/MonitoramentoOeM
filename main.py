@@ -228,24 +228,36 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
 # =====================================
 LAST_ALERT_FILE = "last_alert.json"
 
-def get_last_alert_time():
-    """Lê o último timestamp de alerta salvo."""
+def get_last_alert_times():
+    """Lê o último timestamp de alerta salvo (relé e inversor)."""
+    default = {"last_relay_ts": datetime.min.isoformat(), "last_inverter_ts": datetime.min.isoformat()}
     if os.path.exists(LAST_ALERT_FILE):
         try:
             with open(LAST_ALERT_FILE) as f:
                 data = json.load(f)
-                return datetime.fromisoformat(data.get("last_ts"))
+                return {
+                    "last_relay_ts": datetime.fromisoformat(data.get("last_relay_ts", default["last_relay_ts"])),
+                    "last_inverter_ts": datetime.fromisoformat(data.get("last_inverter_ts", default["last_inverter_ts"]))
+                }
         except Exception:
             pass
-    return datetime.min
+    return {
+        "last_relay_ts": datetime.min,
+        "last_inverter_ts": datetime.min
+    }
 
-def update_last_alert_time(ts: datetime):
-    """Atualiza o timestamp do último alerta."""
+def update_last_alert_time(tipo: str, ts: datetime):
+    """Atualiza o timestamp do último alerta por tipo ('relay' ou 'inverter')."""
     try:
+        data = {}
+        if os.path.exists(LAST_ALERT_FILE):
+            with open(LAST_ALERT_FILE) as f:
+                data = json.load(f)
+        data[f"last_{tipo}_ts"] = ts.isoformat()
         with open(LAST_ALERT_FILE, "w") as f:
-            json.dump({"last_ts": ts.isoformat()}, f)
+            json.dump(data, f)
     except Exception as e:
-        logger.warning(f"Não foi possível salvar timestamp de alerta: {e}")
+        logger.warning(f"Não foi possível salvar timestamp de alerta ({tipo}): {e}")
 
 # =====================================
 # EXECUÇÃO AUTOMÁTICA (ATUALIZADA)
@@ -264,8 +276,8 @@ def main():
 
     agora = datetime.now()
     # Janela móvel de 25 minutos (tolerância para cron atrasado)
-    inicio_janela = agora - timedelta(minutes=30)
-    ultimo_alerta = get_last_alert_time()
+    inicio_janela = agora - timedelta(minutes=25)
+    last_times = get_last_alert_times()
     logger.info(f"Analisando período entre {inicio_janela} e {agora}")
 
     for p in plantas:
@@ -277,7 +289,7 @@ def main():
         # RELÉS
         alertas = detectar_alertas_rele(api, usina_id, inicio_janela, agora)
         for a in alertas:
-            if a["ts_leitura"] <= ultimo_alerta:
+            if a["ts_leitura"] <= last_times["last_relay_ts"]:
                 continue  # já enviado antes
 
             msg = (
@@ -294,13 +306,13 @@ def main():
                 severity="danger",
                 facts=[("Capacidade", f"{cap} kWp")]
             )
-            update_last_alert_time(a["ts_leitura"])
+            update_last_alert_time("relay", a["ts_leitura"])
             break  # prioridade: não processa inversores nesta usina
 
         else:  # só roda inversores se não houve alerta de relé
             falhas = detectar_falhas_inversores(api, usina_id, inicio_janela, agora)
             for f in falhas:
-                if f["ts_leitura"] <= ultimo_alerta:
+                if f["ts_leitura"] <= last_times["last_inverter_ts"]:
                     continue  # já enviado antes
 
                 msg = (
@@ -317,7 +329,7 @@ def main():
                     severity="danger",
                     facts=[("Capacidade", f"{cap} kWp")]
                 )
-                update_last_alert_time(f["ts_leitura"])
+                update_last_alert_time("inverter", f["ts_leitura"])
 
     logger.info("Varredura concluída com sucesso.")
     print("✅ Concluído.")
