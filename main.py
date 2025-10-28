@@ -216,7 +216,7 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
         for ts, pac in leituras:
             if pac == 0:
                 seq += 1
-                if seq >= 3:
+                if seq >= 1:
                     falhas.append({"inversor_id": inv_id, "ts_leitura": ts, "pac": pac})
                     break
             else:
