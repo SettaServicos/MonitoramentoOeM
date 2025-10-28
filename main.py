@@ -324,7 +324,7 @@ def main():
                 )
                 logger.warning(msg)
                 _teams_post_card(
-                    title="⚠ Falha de Inversor (Pac=0 por 3 leituras consecutivas)",
+                    title="⚠ Falha de Inversor (Pac=0)",
                     text=msg.replace("\n", "  \n"),
                     severity="danger",
                     facts=[("Capacidade", f"{cap} kWp")]
