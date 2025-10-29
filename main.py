@@ -216,7 +216,7 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
         for ts, pac in leituras:
             if pac == 0:
                 seq += 1
-                if seq >= 1:
+                if seq >= 3:
                     falhas.append({"inversor_id": inv_id, "ts_leitura": ts, "pac": pac})
                     break
             else:
@@ -290,7 +290,7 @@ def main():
         alertas = detectar_alertas_rele(api, usina_id, inicio_janela, agora)
         for a in alertas:
             if a["ts_leitura"] <= last_times["last_relay_ts"]:
-                continue  # já enviado antes
+                continue
 
             msg = (
                 f"⚠ Alerta de Relé ({a['tipo_alerta']})\n"
@@ -307,13 +307,19 @@ def main():
                 facts=[("Capacidade", f"{cap} kWp")]
             )
             update_last_alert_time("relay", a["ts_leitura"])
-            break  # prioridade: não processa inversores nesta usina
+            break
 
         else:  # só roda inversores se não houve alerta de relé
+            hora_atual = datetime.now().time()
+            LIMITE_INVERSOR = dtime(17, 0)
+            if hora_atual >= LIMITE_INVERSOR:
+                logger.info(f"⏸ Após {LIMITE_INVERSOR.strftime('%H:%M')}, ignorando alertas de inversor para {nome}.")
+                continue
+
             falhas = detectar_falhas_inversores(api, usina_id, inicio_janela, agora)
             for f in falhas:
                 if f["ts_leitura"] <= last_times["last_inverter_ts"]:
-                    continue  # já enviado antes
+                    continue
 
                 msg = (
                     f"⚠ Falha de Inversor\n"
