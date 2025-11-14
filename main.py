@@ -118,7 +118,7 @@ class PVOperationAPI:
                     f"{self.base_url}/{endpoint}",
                     json={"id": int(plant_id), "date": date.strftime("%Y-%m-%d")},
                     headers=self.headers,
-                    timeout=60
+                    timeout=20
                 )
             if r.status_code == 200:
                 return r.json()
