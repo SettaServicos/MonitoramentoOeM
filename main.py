@@ -122,8 +122,8 @@ class PVOperationAPI:
                 )
             if r.status_code == 200:
                 return r.json()
-        except Timeout:
-            logger.warning(f"Timeout em {endpoint} (usina {plant_id}, {date.date()})")
+        # except Timeout:
+        #     logger.warning(f"Timeout em {endpoint} (usina {plant_id}, {date.date()})")
         except Exception as e:
             logger.error(f"Erro em {endpoint}: {e}")
         return None
