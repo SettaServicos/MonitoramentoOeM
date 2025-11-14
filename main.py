@@ -107,7 +107,6 @@ class PVOperationAPI:
 
     def post_day(self, endpoint: str, plant_id: int, date: datetime):
         try:
-            print("request 1")
             r = self.session.post(
                 f"{self.base_url}/{endpoint}",
                 json={"id": int(plant_id), "date": date.strftime("%Y-%m-%d")},
@@ -115,7 +114,6 @@ class PVOperationAPI:
                 timeout=(5, 30)
             )
             if r.status_code == 401 and self.verificar_token():
-                print("request 2")
                 r = self.session.post(
                     f"{self.base_url}/{endpoint}",
                     json={"id": int(plant_id), "date": date.strftime("%Y-%m-%d")},
