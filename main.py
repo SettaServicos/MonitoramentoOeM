@@ -341,4 +341,5 @@ def main():
     print("✅ Concluído.")
 
 if __name__ == "__main__":
+    print("dale")
     main()
