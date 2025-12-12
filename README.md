@@ -1,56 +1,139 @@
-# GUIA – MONITOR DE RELÉS E INVERSORES
+# GUIA – MONITOR DE RELÉS E INVERSORES (HEADLESS)
 
 ## 📋 Objetivo
-O aplicativo foi desenvolvido para monitorar automaticamente os relés e inversores das usinas. Ele busca dados na plataforma PVOperation e mostra alertas em tempo real na tela e, se configurado, também envia notificações no Microsoft Teams.
+
+O serviço foi desenvolvido para monitorar automaticamente os **relés** e **inversores** das usinas em modo *headless*.  
+Ele consulta a **API PVOperation**, detecta alertas de relé e falhas de inversor e envia notificações no **Microsoft Teams**.
+
+Não há interface gráfica: toda a visibilidade ocorre por meio de **logs** e **mensagens no Teams**.
+
+---
 
 ## ⚙️ Como o Programa Funciona
 
-### 🔄 Ciclo de Operação
-1. **Primeira varredura**: Ao abrir o programa, ele analisa todos os relés e inversores desde o início do dia até o momento atual
-2. **Varreduras subsequentes**: Ocorrem automaticamente a cada **20 minutos**
+### 1. Primeira varredura
 
-### 🎯 Prioridades e Regras
-- **Prioridade de alertas**: Se houver alerta de Relé em uma usina, os inversores dessa usina são ignorados naquele ciclo (para evitar ruído de informação)
-- **Inversores**:
-  - São analisados apenas no período **06:30 até 17:30**
-  - Uma falha é registrada quando o **Pac = 0 em 3 leituras seguidas** com intervalo de 5 minutos
-  - A falha desaparece automaticamente quando o inversor volta a gerar (Pac > 0)
-- **Sem Dados**: Aplica-se apenas para inversores (não se aplica a relés)
+Ao iniciar o serviço:
 
-## 🖥️ Interface do Usuário
+- Analisa os dados desde o início do dia (**00:00**) até o momento atual.
 
-O programa abre uma janela com várias abas organizadas:
+### 2. Próximas varreduras
 
-### 📊 Abas Disponíveis
-- **Alertas Relés**: Lista de usinas e relés que tiveram atuação, com cores diferentes para cada tipo (sobretensão, subtensão, frequência, etc.)
-- **Alertas Inversores**: Mostra os inversores em falha segundo as regras estabelecidas
-- **Estatísticas**: Gráficos simples com a contagem de alertas de relé e de falhas de inversores
-- **Sem Dados**: Usinas que não retornaram leituras de inversores no período
+As varreduras seguintes usam uma janela **incremental**:
 
-### 🔔 Sistema de Notificações
-- **Popup sonoro**: Sempre que surge um novo alerta, abre um popup com som na tela
-- **Informações do alerta**: Usina, equipamento, horário, tipo de alerta e parâmetros envolvidos
-- **Integração Teams**: Se configurado, o mesmo alerta é enviado para o Microsoft Teams via webhook
+- Sempre do **último horário varrido** até “agora”.
+- Evitam reprocessar o dia inteiro.
 
-## 👨‍💻 Instruções para o Operador
+Intervalos padrão:
 
-### 📝 Ações Recomendadas
-- Acompanhar continuamente a tela de alertas
-- Verificar a ocorrência quando aparecer um alerta (popup e lista)
-- Consultar as abas de Estatísticas e Sem Dados para ter visão geral
-- Usar o botão **"Limpar"** quando quiser reiniciar as listas de exibição (os dados novos serão carregados na próxima varredura)
+- **Relés:** a cada **10 minutos**.  
+- **Inversores:** a cada **15 minutos**.
 
-### 📍 Barra de Status Inferior
-- Contador regressivo para a próxima varredura
-- Número de alertas ativos
-- Status atual do sistema
+### 🎯 3. Prioridade entre relé e inversor
 
-## 🎯 Resumo das Características
+- Se houver **alerta de relé** em uma usina no ciclo:
+  - Os **inversores dessa usina** são ignorados naquele ciclo (para evitar ruído de informação).
+  - Os **estados de falha dos inversores** dessa usina são **zerados** sempre que há alerta de relé no ciclo.
 
-- **✅ Automático**: O programa busca dados e atualiza sozinho a cada 20 min
-- **✅ Crítico**: Sempre que um relé atua, você será avisado com som e popup
-- **✅ Confiável**: Falhas de inversores só aparecem quando confirmadas por sequência de leituras
-- **✅ Organizado**: Tudo fica separado por abas e cores, facilitando a visualização
+### 🎯 4. Regras específicas para inversores
+
+- São analisados apenas no período de **06:30** até **17:30**.
+- Uma falha de inversor é registrada quando:
+  - `Pac == 0` em **3 leituras consecutivas**  
+  - Não é obrigatório ter exatamente 5 minutos entre cada leitura; basta que sejam leituras sequenciais.
+- A falha desaparece automaticamente quando o inversor volta a gerar:
+  - `Pac > 0` limpa a condição de falha.
+
+### 🔄 5. Timeouts / sem dados de inversor
+
+- Quando não há retorno de dados ou ocorre **timeout** da API para os inversores, o programa:
+  - Registra um **aviso nos logs**.
+  - Marca a usina/inversor internamente com o motivo:
+    - `TIMEOUT`; ou  
+    - `SEM_DADOS`.
+- Não há qualquer interface gráfica para esse tipo de ocorrência, apenas logs.
+
+### 🔔 6. Deduplicação de alertas
+
+#### Relé
+
+- Um alerta é enviado na **primeira detecção** de uma combinação:
+
+  > `usina : relé : tipo`
+
+- Enquanto o alerta permanecer **ativo** (a condição não mudou):
+  - O programa **não repete** o mesmo alerta.
+- Se a condição **desaparecer** e depois **voltar a ocorrer**:
+  - Um **novo alerta** é enviado normalmente.
+
+#### Inversor
+
+- A falha de `Pac == 0` gera um **alerta uma única vez**, quando confirmada.
+- Ao **normalizar** (`Pac > 0`):
+  - O alerta é removido internamente.
+- Se a falha voltar a ocorrer após a normalização:
+  - Um **novo alerta** pode ser enviado.
+
+---
+
+## O que você verá (logs e Teams)
+
+Como o serviço é **headless**, não há janelas ou abas na tela.  
+A observação do sistema acontece por dois canais principais:
+
+### Logs
+
+- Registram **início** e **fim** de cada varredura.
+- Registram **alertas de relé** e **falhas de inversor** em nível `WARNING` (ou equivalente).
+- Registram também avisos de:
+  - `TIMEOUT`
+  - `SEM_DADOS`
+
+### Microsoft Teams
+
+- Cada novo alerta de relé ou falha de inversor gera uma **mensagem** no canal configurado.
+- As mensagens trazem as principais informações:
+  - **Usina**
+  - **Relé/Inversor**
+  - **Horário**
+  - **Tipo/detalhes** da ocorrência
+  - **Capacidade** da usina/equipamento
+
+---
+
+## Como são apresentados os alertas
+
+Sempre que surge um **novo alerta** (*não duplicado*), o serviço envia uma mensagem para o Teams usando o webhook configurado.
+
+Conteúdo típico da mensagem:
+
+- Nome da **usina**
+- Identificação do **relé** ou **inversor**
+- **Horário** da detecção
+- **Tipo de alerta ou falha**, com detalhes relevantes (por exemplo: `Pac == 0`, subtensão, etc.)
+- **Capacidade** da usina/equipamento e outros dados complementares definidos na mensagem
+
+### Nível de severidade
+
+- **Relés:** classificados como **perigo** ou **aviso**, de acordo com o tipo de atuação.  
+- **Inversores:** tratados como alerta de **perigo** quando confirmada falha de geração (`Pac == 0` nas condições definidas).
+
+Paralelamente, o mesmo evento é registrado nos **logs** do aplicativo em nível `WARNING`.
+
+---
+
+## Configuração de SSL (servidor)
+
+O cliente HTTP (`requests`) utiliza uma `Session` com o atributo `verify`.
+
+Por padrão:
+
+```python
+VERIFY_CA = (
+    os.environ.get("SSL_CERT_FILE")
+    or os.environ.get("REQUESTS_CA_BUNDLE")
+    or True
+)
 
 ---
 
