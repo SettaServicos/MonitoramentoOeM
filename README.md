@@ -135,6 +135,4 @@ VERIFY_CA = (
     or True
 )
 
----
-
 *Sistema de monitoramento contínuo para garantir a operação eficiente das usinas*
