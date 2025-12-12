@@ -1,10 +1,10 @@
-# =============================================
+# ============================================
 # Monitor de Relés/Inversores (headless, Teams)
 # - Sem UI/monitor; roda em servidor e envia alertas para Teams.
 # - SSL: use verificação adequada. No servidor, aponte a variável
 #   de ambiente SSL_CERT_FILE ou REQUESTS_CA_BUNDLE para o bundle
 #   de CA válido (ex.: .pem fornecido pela infra) ou ajuste VERIFY_CA.
-# =============================================
+# ============================================
 
 import os
 import json
