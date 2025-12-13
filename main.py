@@ -1,10 +1,10 @@
-# ===========================================
+# ============================================
 # Monitor de Relés/Inversores (headless, Teams)
 # - Sem UI/monitor; roda em servidor e envia alertas para Teams.
 # - SSL: use verificação adequada. No servidor, aponte a variável
 #   de ambiente SSL_CERT_FILE ou REQUESTS_CA_BUNDLE para o bundle
 #   de CA válido (ex.: .pem fornecido pela infra) ou ajuste VERIFY_CA.
-# ===========================================
+# ============================================
 
 import os
 import json
@@ -12,10 +12,15 @@ import time
 import logging
 import threading
 from datetime import datetime, timedelta, time as dtime
+from pathlib import Path
 from requests import Session
 from requests.exceptions import Timeout
 import requests
 import re
+import atexit
+import os
+import sys
+import fcntl
 
 # --- Configuração geral ---
 RELAY_INTERVAL = 600          # 10 min
@@ -40,6 +45,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RelayMonitorHeadless")
 
+# Diretórios/arquivos de controle
+BASE_DIR = Path(__file__).resolve().parent
+STATE_FILE = BASE_DIR / "monitor_state.json"
+LOCK_FILE = BASE_DIR / ".monitor_lock"
+
+# evite reprocessar a borda final da janela (pula 1 segundo além do último fim)
+WINDOW_DELTA_SECONDS = 1
 
 def _teams_post_card(title, text, severity="info", facts=None):
     """Envia um 'MessageCard' para um Incoming Webhook do Microsoft Teams."""
@@ -368,13 +380,83 @@ class MonitorService:
         self.stop_event = threading.Event()
         self.ultima_varredura_rele = None
         self.ultima_varredura_inversor = None
+        self._lock_fd = None
 
     def start(self):
+        self._acquire_lock()
+        self._load_state()
+        atexit.register(self._release_lock)
+        atexit.register(self._save_state)
         threading.Thread(target=self._loop_rele, daemon=True).start()
         threading.Thread(target=self._loop_inversor, daemon=True).start()
 
     def stop(self):
         self.stop_event.set()
+        self._save_state()
+        self._release_lock()
+
+    def _acquire_lock(self):
+        try:
+            self._lock_fd = open(LOCK_FILE, "a+")
+            fcntl.lockf(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_fd.seek(0)
+            self._lock_fd.truncate(0)
+            self._lock_fd.write(str(os.getpid()))
+            self._lock_fd.flush()
+        except BlockingIOError:
+            logger.error("Já existe uma instância em execução (lock ativo). Encerrando.")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Não foi possível criar lock de instância única: {e}")
+            sys.exit(1)
+
+    def _release_lock(self):
+        try:
+            if self._lock_fd:
+                fcntl.lockf(self._lock_fd, fcntl.LOCK_UN)
+                self._lock_fd.close()
+                self._lock_fd = None
+        except Exception:
+            pass
+
+    def _load_state(self):
+        if not STATE_FILE.exists():
+            return
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            self.ultima_varredura_rele = (
+                datetime.fromisoformat(data.get("ultima_varredura_rele"))
+                if data.get("ultima_varredura_rele") else None
+            )
+            self.ultima_varredura_inversor = (
+                datetime.fromisoformat(data.get("ultima_varredura_inversor"))
+                if data.get("ultima_varredura_inversor") else None
+            )
+            self.rele_alertas_ativos = set(data.get("rele_alertas_ativos", []))
+            self.rele_notificados = set(data.get("rele_notificados", []))
+            self.rele_alerta_chave = data.get("rele_alerta_chave", {})
+            self.inversores_ativos = data.get("inversores_ativos", {})
+            self.inv_notificados = set(data.get("inv_notificados", []))
+            self.falhas_ativas_por_inv = data.get("falhas_ativas_por_inv", {})
+            logger.info("Estado carregado do disco.")
+        except Exception as e:
+            logger.warning(f"Não foi possível carregar estado salvo: {e}")
+
+    def _save_state(self):
+        try:
+            payload = {
+                "ultima_varredura_rele": self.ultima_varredura_rele.isoformat() if self.ultima_varredura_rele else None,
+                "ultima_varredura_inversor": self.ultima_varredura_inversor.isoformat() if self.ultima_varredura_inversor else None,
+                "rele_alertas_ativos": list(self.rele_alertas_ativos),
+                "rele_notificados": list(self.rele_notificados),
+                "rele_alerta_chave": self.rele_alerta_chave,
+                "inversores_ativos": self.inversores_ativos,
+                "inv_notificados": list(self.inv_notificados),
+                "falhas_ativas_por_inv": self.falhas_ativas_por_inv,
+            }
+            STATE_FILE.write_text(json.dumps(payload), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Falha ao salvar estado: {e}")
 
     def _loop_rele(self):
         while not self.stop_event.is_set():
@@ -394,7 +476,11 @@ class MonitorService:
 
     def executar_varredura_rele(self):
         agora = datetime.now()
-        inicio_janela = self.ultima_varredura_rele or datetime.combine(agora.date(), datetime.min.time())
+        # começa no último fim de varredura + delta; primeira vez vai até 00:00
+        if self.ultima_varredura_rele:
+            inicio_janela = self.ultima_varredura_rele + timedelta(seconds=WINDOW_DELTA_SECONDS)
+        else:
+            inicio_janela = datetime.combine(agora.date(), datetime.min.time())
         logger.info("Varredura de relé iniciada.")
 
         plantas = self.api.get_plants()
@@ -450,7 +536,10 @@ class MonitorService:
 
     def executar_varredura_inversor(self):
         agora = datetime.now()
-        inicio_janela = self.ultima_varredura_inversor or datetime.combine(agora.date(), datetime.min.time())
+        if self.ultima_varredura_inversor:
+            inicio_janela = self.ultima_varredura_inversor + timedelta(seconds=WINDOW_DELTA_SECONDS)
+        else:
+            inicio_janela = datetime.combine(agora.date(), datetime.min.time())
         logger.info("Varredura de inversor iniciada.")
 
         plantas = self.api.get_plants()
