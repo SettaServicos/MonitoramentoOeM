@@ -41,8 +41,8 @@ Intervalos padrão:
 - Uma falha de inversor é registrada quando:
   - `Pac == 0` em **3 leituras consecutivas**  
   - Não é obrigatório ter exatamente 5 minutos entre cada leitura; basta que sejam leituras sequenciais.
-- A falha desaparece automaticamente quando o inversor volta a gerar:
-  - `Pac > 0` limpa a condição de falha.
+- A falha desaparece quando o inversor volta a gerar em sequência:
+  - `Pac > 0` em **3 leituras consecutivas** limpa a condição de falha e gera aviso de normalização.
 
 ### 🔄 5. Timeouts / sem dados de inversor
 
@@ -69,8 +69,8 @@ Intervalos padrão:
 #### Inversor
 
 - A falha de `Pac == 0` gera um **alerta uma única vez**, quando confirmada.
-- Ao **normalizar** (`Pac > 0`):
-  - O alerta é removido internamente.
+- Ao **normalizar** (`Pac > 0` em 3 leituras seguidas):
+  - O alerta é removido internamente e é enviada uma notificação de normalização.
 - Se a falha voltar a ocorrer após a normalização:
   - Um **novo alerta** pode ser enviado.
 
@@ -134,5 +134,6 @@ VERIFY_CA = (
     or os.environ.get("REQUESTS_CA_BUNDLE")
     or True
 )
+```
 
 **Sistema de monitoramento contínuo para garantir a operação eficiente das usinas**

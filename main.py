@@ -322,34 +322,38 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
         d += timedelta(days=1)
 
     falhas = []
-    falhas_ativas = dict(falhas_ativas_previas)
-    resolvidos = set()
+    recuperados = []
+    falhas_ativas = {}
 
     for inv_id, lst in leituras_por_inv.items():
         if not lst:
             continue
         lst.sort(key=lambda x: x["ts"])
 
-        seq = 0
         state_key = f"{plant_id}:{inv_id}"
-        ativa = falhas_ativas.get(state_key, False)
+        prev_state = falhas_ativas_previas.get(state_key, {"ativa": False, "rec_seq": 0})
+        if isinstance(prev_state, bool):
+            prev_state = {"ativa": prev_state, "rec_seq": 0}
+        ativa = bool(prev_state.get("ativa", False))
+        rec_seq = int(prev_state.get("rec_seq", 0))
+        seq_zero = 0
 
         for item in lst:
             ts = item["ts"]
             if item["sem_dados"]:
-                seq = 0
+                seq_zero = 0
+                rec_seq = 0
                 continue
 
-            if not item["cond_ok"]:
-                seq = 0
-                if ativa:
-                    ativa = False
-                    resolvidos.add(state_key)
-                continue
+            pac_zero = item["cond_ok"]  # True se potência == 0.0
+            if pac_zero:
+                seq_zero = seq_zero + 1
+                rec_seq = 0
+            else:
+                seq_zero = 0
+                rec_seq = rec_seq + 1
 
-            seq = seq + 1 if seq > 0 else 1
-
-            if seq >= 3 and not ativa:
+            if seq_zero >= 3 and not ativa:
                 falhas.append(
                     {
                         "inversor_id": str(inv_id),
@@ -359,10 +363,23 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
                     }
                 )
                 ativa = True
+                rec_seq = 0
 
-        falhas_ativas[state_key] = ativa
+            if ativa and rec_seq >= 3:
+                recuperados.append(
+                    {
+                        "inversor_id": str(inv_id),
+                        "ts_leitura": ts,
+                        "status": "NORMALIZADO",
+                        "indicadores": {"pac": item.get("pac", None)},
+                    }
+                )
+                ativa = False
+                rec_seq = 0
 
-    return falhas, tem_dados, falhas_ativas, teve_timeout, resolvidos
+        falhas_ativas[state_key] = {"ativa": ativa, "rec_seq": rec_seq}
+
+    return falhas, recuperados, tem_dados, falhas_ativas, teve_timeout
 
 
 class MonitorService:
@@ -559,17 +576,27 @@ class MonitorService:
             nome = p.get("nome")
             cap = p.get("capacidade")
 
-            falhas, tem_dados_inv, falhas_ativas_atual, teve_timeout, resolvidos = detectar_falhas_inversores(
+            falhas, recuperados, tem_dados_inv, falhas_ativas_atual, teve_timeout = detectar_falhas_inversores(
                 self.api, usina_id, inicio_janela, agora, self.falhas_ativas_por_inv
             )
             self.falhas_ativas_por_inv.update(falhas_ativas_atual)
 
-            for state_key in resolvidos:
-                inv_base = state_key.split(":", 1)[1] if ":" in state_key else state_key
+            for rec in recuperados:
+                inv_base = rec["inversor_id"]
                 chave_inv = f"{usina_id}_{inv_base}"
                 if chave_inv in self.inversores_ativos:
                     del self.inversores_ativos[chave_inv]
                 self.inv_notificados.discard(chave_inv)
+                self._notificar_inversor_recuperado(
+                    {
+                        "usina": nome,
+                        "capacidade": cap,
+                        "inversor": inv_base,
+                        "horario": rec["ts_leitura"].strftime("%d/%m/%Y %H:%M:%S"),
+                        "status": rec["status"],
+                        "indicadores": rec.get("indicadores", {}),
+                    }
+                )
 
             if not tem_dados_inv:
                 motivo = "TIMEOUT" if teve_timeout else "SEM_DADOS"
@@ -652,6 +679,32 @@ class MonitorService:
             )
         except Exception:
             logger.exception("Falha ao notificar Teams (inversor)")
+
+    def _notificar_inversor_recuperado(self, alerta):
+        inds = alerta.get("indicadores", {})
+        detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
+        msg = (
+            f"Usina: {alerta['usina']}\n"
+            f"Inversor: {alerta['inversor']}\n"
+            f"Status: {alerta['status']}\n"
+            f"Horário: {alerta['horario']}\n"
+            f"{detalhes_txt}"
+        )
+        logger.info(f"[RECUPERAÇÃO INVERSOR] {msg.replace(chr(10), ' | ')}")
+        try:
+            _teams_post_card(
+                title="✔️ Inversor normalizado (3 leituras > 0 após falha)",
+                text=(
+                    f"**Usina:** {alerta['usina']}  \n"
+                    f"**Inversor:** {alerta['inversor']}  \n"
+                    f"**Horário:** {alerta['horario']}  \n"
+                    f"**Detalhes:** {detalhes_txt}"
+                ),
+                severity="info",
+                facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
+            )
+        except Exception:
+            logger.exception("Falha ao notificar Teams (recuperação inversor)")
 
 
 def main():
