@@ -18,12 +18,12 @@ jobs:
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
+          key: |
+            ${{ secrets.EC2_SSH_KEY }}
           script: |
             cd /home/ubuntu/Repositories/MonitoramentoOeM
             git fetch origin main
             git reset --hard origin/main
             source venv/bin/activate
             pip install -r requirements.txt
-            sudo systemctl reload monitoramento_oem || sudo systemctl restart monitoramento_oem
             echo "✅ MonitoramentoOeM deployed successfully!"
