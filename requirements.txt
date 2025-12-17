@@ -20,7 +20,7 @@ rich
 tenacity
 tqdm
 psutil
-win10toast
+win10toast; platform_system == "Windows"
 requests
 numpy
 pandas
