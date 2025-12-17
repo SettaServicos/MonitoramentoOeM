@@ -10,6 +10,7 @@ import os
 import json
 import time
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import threading
 from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
@@ -39,19 +40,55 @@ TEAMS_ENABLED = bool(TEAMS_WEBHOOK_URL)
 # SSL: ajuste para o bundle correto no servidor (ex.: /etc/ssl/certs/ca.pem)
 VERIFY_CA = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or True
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger("RelayMonitorHeadless")
-
 # Diretórios/arquivos de controle
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "monitor_state.json"
 LOCK_FILE = BASE_DIR / ".monitor_lock"
+LOG_DIR = BASE_DIR / "logs"
+LOG_RELE_DIR = LOG_DIR / "rele"
+LOG_INV_DIR = LOG_DIR / "inversor"
 
 # evite reprocessar a borda final da janela (pula 1 segundo além do último fim)
 WINDOW_DELTA_SECONDS = 1
+
+
+def setup_logging():
+    LOG_RELE_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_INV_DIR.mkdir(parents=True, exist_ok=True)
+
+    fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+    base_logger = logging.getLogger("RelayMonitorHeadless")
+    base_logger.setLevel(logging.INFO)
+    base_logger.handlers.clear()
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(fmt)
+    base_logger.addHandler(console)
+
+    logger_rele = logging.getLogger("RelayMonitorHeadless.rele")
+    logger_rele.setLevel(logging.INFO)
+    logger_rele.handlers.clear()
+    h_rele = TimedRotatingFileHandler(LOG_RELE_DIR / "rele.log", when="midnight", backupCount=7, encoding="utf-8")
+    h_rele.setLevel(logging.INFO)
+    h_rele.setFormatter(fmt)
+    logger_rele.addHandler(h_rele)
+    logger_rele.propagate = True
+
+    logger_inv = logging.getLogger("RelayMonitorHeadless.inversor")
+    logger_inv.setLevel(logging.INFO)
+    logger_inv.handlers.clear()
+    h_inv = TimedRotatingFileHandler(LOG_INV_DIR / "inversor.log", when="midnight", backupCount=7, encoding="utf-8")
+    h_inv.setLevel(logging.INFO)
+    h_inv.setFormatter(fmt)
+    logger_inv.addHandler(h_inv)
+    logger_inv.propagate = True
+
+
+setup_logging()
+logger = logging.getLogger("RelayMonitorHeadless")
+logger_rele = logging.getLogger("RelayMonitorHeadless.rele")
+logger_inv = logging.getLogger("RelayMonitorHeadless.inversor")
 
 def _teams_post_card(title, text, severity="info", facts=None):
     """Envia um 'MessageCard' para um Incoming Webhook do Microsoft Teams."""
@@ -488,7 +525,7 @@ class MonitorService:
             try:
                 self.executar_varredura_inversor()
             except Exception:
-                logger.exception("Erro na varredura de inversor")
+                logger_inv.exception("Erro na varredura de inversor")
             self.stop_event.wait(INVERTER_INTERVAL)
 
     def executar_varredura_rele(self):
@@ -498,11 +535,11 @@ class MonitorService:
             inicio_janela = self.ultima_varredura_rele + timedelta(seconds=WINDOW_DELTA_SECONDS)
         else:
             inicio_janela = datetime.combine(agora.date(), datetime.min.time())
-        logger.info("Varredura de relé iniciada.")
+        logger_rele.info("Varredura de rele iniciada.")
 
         plantas = self.api.get_plants()
         if not plantas:
-            logger.warning("Nenhuma usina encontrada (relé).")
+            logger_rele.warning("Nenhuma usina encontrada (rele).")
             self.usinas_alerta_rele_recente = set()
             return
 
@@ -549,7 +586,7 @@ class MonitorService:
             self.rele_notificados.discard(base)
 
         self.ultima_varredura_rele = agora
-        logger.info("Varredura de relé concluída.")
+        logger_rele.info("Varredura de rele concluida.")
 
     def executar_varredura_inversor(self):
         agora = datetime.now()
@@ -557,17 +594,17 @@ class MonitorService:
             inicio_janela = self.ultima_varredura_inversor + timedelta(seconds=WINDOW_DELTA_SECONDS)
         else:
             inicio_janela = datetime.combine(agora.date(), datetime.min.time())
-        logger.info("Varredura de inversor iniciada.")
+        logger_inv.info("Varredura de inversor iniciada.")
 
         plantas = self.api.get_plants()
         if not plantas:
-            logger.warning("Nenhuma usina encontrada (inversor).")
+            logger_inv.warning("Nenhuma usina encontrada (inversor).")
             return
 
         for p in plantas:
             usina_id = str(p.get("id"))
             if usina_id in self.usinas_alerta_rele_recente:
-                logger.info(f"Pulando inversores de {p.get('nome')} devido a alerta de relé recente.")
+                logger_inv.info(f"Pulando inversores de {p.get('nome')} devido a alerta de rele recente.")
                 for k in list(self.falhas_ativas_por_inv.keys()):
                     if k.startswith(f"{usina_id}:"):
                         del self.falhas_ativas_por_inv[k]
@@ -600,7 +637,7 @@ class MonitorService:
 
             if not tem_dados_inv:
                 motivo = "TIMEOUT" if teve_timeout else "SEM_DADOS"
-                logger.warning(f"Sem dados de inversor em {nome} (motivo: {motivo}).")
+                logger_inv.warning(f"Sem dados de inversor em {nome} (motivo: {motivo}).")
 
             for f in falhas:
                 chave_inv = f"{usina_id}_{f['inversor_id']}"
@@ -638,7 +675,7 @@ class MonitorService:
             f"Horário: {alerta['horario']}\n"
             f"Parâmetros: {alerta['parametros']}"
         )
-        logger.warning(f"[ALERTA RELÉ] {msg.replace(chr(10), ' | ')}")
+        logger_rele.warning(f"[ALERTA RELE] {msg.replace(chr(10), ' | ')}")
         try:
             _teams_post_card(
                 title=f"⚠️ Alerta de Relé ({alerta['tipo']})",
@@ -652,7 +689,7 @@ class MonitorService:
                 facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
             )
         except Exception:
-            logger.exception("Falha ao notificar Teams (relé)")
+            logger_rele.exception("Falha ao notificar Teams (rele)")
 
     def _notificar_inversor(self, alerta):
         inds = alerta.get("indicadores", {})
@@ -664,7 +701,7 @@ class MonitorService:
             f"Horário: {alerta['horario']}\n"
             f"{detalhes_txt}"
         )
-        logger.warning(f"[ALERTA INVERSOR] {msg.replace(chr(10), ' | ')}")
+        logger_inv.warning(f"[ALERTA INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             _teams_post_card(
                 title="⚠️ Falha de Inversor (Pac=0; 3 leituras consecutivas; 06:30–17:30)",
@@ -678,7 +715,7 @@ class MonitorService:
                 facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
             )
         except Exception:
-            logger.exception("Falha ao notificar Teams (inversor)")
+            logger_inv.exception("Falha ao notificar Teams (inversor)")
 
     def _notificar_inversor_recuperado(self, alerta):
         inds = alerta.get("indicadores", {})
@@ -690,7 +727,7 @@ class MonitorService:
             f"Horário: {alerta['horario']}\n"
             f"{detalhes_txt}"
         )
-        logger.info(f"[RECUPERAÇÃO INVERSOR] {msg.replace(chr(10), ' | ')}")
+        logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             _teams_post_card(
                 title="✔️ Inversor normalizado (3 leituras > 0 após falha)",
@@ -704,7 +741,7 @@ class MonitorService:
                 facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
             )
         except Exception:
-            logger.exception("Falha ao notificar Teams (recuperação inversor)")
+            logger_inv.exception("Falha ao notificar Teams (recuperacao inversor)")
 
 
 def main():
