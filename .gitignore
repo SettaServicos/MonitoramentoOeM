@@ -21,3 +21,14 @@ Thumbs.db
 
 # Logs
 *.log
+logs/
+
+# State/locks/caches
+monitor_state*.json*
+*.lock
+.pytest_cache/
+state/
+artifacts/
+
+# Cleanup staging (generated only)
+deletar/generated/
