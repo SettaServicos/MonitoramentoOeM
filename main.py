@@ -1333,27 +1333,72 @@ class MonitorService:
     # Envia notificacao de heartbeat/saude em horarios fixos.
     def _enviar_heartbeat(self, previsto: datetime):
         with self._scan_lock:
-            ativos_rele = len(self.rele_alertas_ativos)
-            ativos_inv = sum(1 for estado in self.estado_inversores.values() if estado.get("ativa"))
+            rele_alertas = list(self.rele_alertas_ativos)
+            rele_alerta_chave = dict(self.rele_alerta_chave)
+            estado_inversores = dict(self.estado_inversores)
+            ativos_rele = len(rele_alertas)
+            ativos_inv = sum(1 for estado in estado_inversores.values() if estado.get("ativa"))
             ultima_rele = self.ultima_varredura_rele
             ultima_inv = self.ultima_varredura_inversor
+
+        rele_usinas = []
+        if ativos_rele:
+            for base in rele_alertas:
+                alerta = rele_alerta_chave.get(base, {})
+                nome = alerta.get("usina")
+                if not nome and isinstance(base, str) and ":" in base:
+                    nome = f"Usina {base.split(':', 1)[0]}"
+                if nome:
+                    rele_usinas.append(nome)
+            rele_usinas = sorted(set(rele_usinas))
+
+        inv_usina_counts = {}
+        if ativos_inv:
+            for chave, estado in estado_inversores.items():
+                if not estado.get("ativa"):
+                    continue
+                alerta = estado.get("alerta") or {}
+                nome = alerta.get("usina")
+                if not nome and isinstance(chave, str) and ":" in chave:
+                    nome = f"Usina {chave.split(':', 1)[0]}"
+                if not nome:
+                    continue
+                inv_usina_counts[nome] = inv_usina_counts.get(nome, 0) + 1
+
         info = [
             f"**Status:** OK",
             f"**Última varredura relé:** {ultima_rele.strftime('%d/%m %H:%M:%S') if ultima_rele else 'N/D'}",
             f"**Última varredura inversor:** {ultima_inv.strftime('%d/%m %H:%M:%S') if ultima_inv else 'N/D'}",
             f"**Alertas de relé ativos:** {ativos_rele}",
-            f"**Alertas de inversor ativos:** {ativos_inv}",
-            f"**Host/PID:** {socket.gethostname()} / {os.getpid()}",
-            f"**Heartbeat previsto:** {previsto.strftime('%d/%m %H:%M')}",
         ]
+        if rele_usinas:
+            for nome in rele_usinas:
+                info.append(f"- {nome}")
+        info.append(f"**Alertas de inversor ativos:** {ativos_inv}")
+        if inv_usina_counts:
+            for nome in sorted(inv_usina_counts):
+                info.append(f"- {nome} ({inv_usina_counts[nome]})")
+        info.extend(
+            [
+                f"**Host/PID:** {socket.gethostname()} / {os.getpid()}",
+                f"**Heartbeat previsto:** {previsto.strftime('%d/%m %H:%M')}",
+            ]
+        )
         texto = "  \n".join(info)
         logger.info(f"[HEARTBEAT] {texto.replace('  \n', ' | ')}")
+        facts = [("Falhas de reles ativos", str(ativos_rele))]
+        if rele_usinas:
+            facts.append(("Usinas com rele", ", ".join(rele_usinas)))
+        facts.append(("Falha de inversores ativos", str(ativos_inv)))
+        if inv_usina_counts:
+            inv_lista = ", ".join(f"{nome} ({inv_usina_counts[nome]})" for nome in sorted(inv_usina_counts))
+            facts.append(("Usinas com inversor", inv_lista))
         try:
             _teams_post_card(
                 title="Heartbeat: monitor rodando",
                 text=texto,
                 severity="info",
-                facts=[("Relé ativos", str(ativos_rele)), ("Inversor ativos", str(ativos_inv))],
+                facts=facts,
             )
         except Exception:
             logger.exception("Falha ao enviar heartbeat")
@@ -1436,27 +1481,29 @@ class MonitorService:
         inds = alerta.get("indicadores", {})
         detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
         msg = (
-            f"Usina: {alerta['usina']}\n"
-            f"Inversor: {alerta['inversor']}\n"
-            f"Status: {alerta['status']}\n"
-            f"Horário: {alerta['horario']}\n"
+            f"Usina: {alerta['usina']}
+"
+            f"Inversor: {alerta['inversor']}
+"
+            f"Status: {alerta['status']}
+"
+            f"Horario: {alerta['horario']}
+"
             f"{detalhes_txt}"
         )
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
-            linhas = []
-            if alerta_prev:
-                linhas.append("**Falha detectada:**")
-                linhas.append(
-                    f"- Horário: {alerta_prev.get('horario','?')} | Status: {alerta_prev.get('status','FALHA')} | "
-                    f"Pac: {alerta_prev.get('indicadores',{}).get('pac','N/A')}"
-                )
-            linhas.append("**Normalizado:**")
-            linhas.append(f"- Horário: {alerta['horario']} | {detalhes_txt}")
-            texto = "\n".join(linhas)
             return _teams_post_card(
-                title=f"✔️ Inversor normalizado - {alerta['inversor']}",
-                text=texto,
+                title="Normalizacao de Inversor (Pac=0; 3 leituras; 06:30-17:30)",
+                text=(
+                    f"**Usina:** {alerta['usina']}  
+"
+                    f"**Inversor:** {alerta['inversor']}  
+"
+                    f"**Horario:** {alerta['horario']}  
+"
+                    f"**Detalhes:** {detalhes_txt}"
+                ),
                 severity="info",
                 facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
             )
