@@ -1387,19 +1387,12 @@ class MonitorService:
         )
         texto = "  \n".join(info)
         logger.info(f"[HEARTBEAT] {texto.replace('  \n', ' | ')}")
-        facts = [("Falhas de reles ativos", str(ativos_rele))]
-        if rele_usinas:
-            facts.append(("Usinas com rele", ", ".join(rele_usinas)))
-        facts.append(("Falha de inversores ativos", str(ativos_inv)))
-        if inv_usina_counts:
-            inv_lista = ", ".join(f"{nome} ({inv_usina_counts[nome]})" for nome in sorted(inv_usina_counts))
-            facts.append(("Usinas com inversor", inv_lista))
         try:
             _teams_post_card(
                 title="Heartbeat: monitor rodando",
                 text=texto,
                 severity="info",
-                facts=facts,
+                facts=None,
             )
         except Exception:
             logger.exception("Falha ao enviar heartbeat")
@@ -1425,8 +1418,8 @@ class MonitorService:
             linhas.append("**Normalizados:**")
             for it in normalizados:
                 linhas.append(
-                    f"- **Relé:** {it['rele']} | **Tipo anterior:** {it.get('tipo','N/A')} | "
-                    f"**Último alerta:** {it.get('horario','?')} | **Parâmetros:** {it.get('parametros','')}"
+                    f"- **Relé:** {it.get('rele','N/A')} | **Tipo:** {it.get('tipo','N/A')} | "
+                    f"**Horário:** {it.get('horario','?')} | **Parâmetros:** {it.get('parametros','')}"
                 )
 
         texto = "\n".join(linhas)
@@ -1491,11 +1484,11 @@ class MonitorService:
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             return _teams_post_card(
-                title="Normalizacao de Inversor (Pac=0; 3 leituras; 06:30-17:30)",
+                title="✔️ Normalização de Inversor (Pac=0; 3 leituras; 06:30-17:30)",
                 text=(
-                    f"**Usina:** {alerta['usina']} \n"
-                    f"**Inversor:** {alerta['inversor']} \n"
-                    f"**Horario:** {alerta['horario']} \n"
+                    f"**Usina:** {alerta['usina']}  \n"
+                    f"**Inversor:** {alerta['inversor']}  \n"
+                    f"**Horario:** {alerta['horario']}  \n"
                     f"**Detalhes:** {detalhes_txt}"
                 ),
                 severity="info",
