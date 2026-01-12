@@ -1475,10 +1475,10 @@ class MonitorService:
         inds = alerta.get("indicadores", {})
         detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
         msg = (
-            f"Usina: {alerta['usina']} \n"
-            f"Inversor: {alerta['inversor']} \n"
-            f"Status: {alerta['status']} \n"
-            f"Horario: {alerta['horario']} \n"
+            f"Usina: {alerta['usina']}\n"
+            f"Inversor: {alerta['inversor']} n"
+            f"Status: {alerta['status']}\n"
+            f"Horario: {alerta['horario']}\n"
             f"{detalhes_txt}"
         )
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
