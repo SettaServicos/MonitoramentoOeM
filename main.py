@@ -52,6 +52,7 @@ INVERTER_INTERVAL = 900       # 15 min
 STOP_JOIN_TIMEOUT = 35        # aguarda encerramento das threads antes de forcar saida
 HEARTBEAT_TIMES = [
     dtime(7, 0),
+    dtime(9, 30),
     dtime(11, 30),
     dtime(17, 0),
     dtime(20, 0),
@@ -1481,14 +1482,10 @@ class MonitorService:
         inds = alerta.get("indicadores", {})
         detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
         msg = (
-            f"Usina: {alerta['usina']}
-"
-            f"Inversor: {alerta['inversor']}
-"
-            f"Status: {alerta['status']}
-"
-            f"Horario: {alerta['horario']}
-"
+            f"Usina: {alerta['usina']} \n"
+            f"Inversor: {alerta['inversor']} \n"
+            f"Status: {alerta['status']} \n"
+            f"Horario: {alerta['horario']} \n"
             f"{detalhes_txt}"
         )
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
@@ -1496,12 +1493,9 @@ class MonitorService:
             return _teams_post_card(
                 title="Normalizacao de Inversor (Pac=0; 3 leituras; 06:30-17:30)",
                 text=(
-                    f"**Usina:** {alerta['usina']}  
-"
-                    f"**Inversor:** {alerta['inversor']}  
-"
-                    f"**Horario:** {alerta['horario']}  
-"
+                    f"**Usina:** {alerta['usina']} \n"
+                    f"**Inversor:** {alerta['inversor']} \n"
+                    f"**Horario:** {alerta['horario']} \n"
                     f"**Detalhes:** {detalhes_txt}"
                 ),
                 severity="info",
