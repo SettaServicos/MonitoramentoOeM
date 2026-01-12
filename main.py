@@ -1476,9 +1476,9 @@ class MonitorService:
         detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
         msg = (
             f"Usina: {alerta['usina']}\n"
-            f"Inversor: {alerta['inversor']} n"
+            f"Inversor: {alerta['inversor']}\n"
             f"Status: {alerta['status']}\n"
-            f"Horario: {alerta['horario']}\n"
+            f"Horário: {alerta['horario']}\n"
             f"{detalhes_txt}"
         )
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
@@ -1488,7 +1488,7 @@ class MonitorService:
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
                     f"**Inversor:** {alerta['inversor']}  \n"
-                    f"**Horario:** {alerta['horario']}  \n"
+                    f"**Horário:** {alerta['horario']}  \n"
                     f"**Detalhes:** {detalhes_txt}"
                 ),
                 severity="info",
