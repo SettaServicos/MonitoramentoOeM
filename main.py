@@ -1112,20 +1112,22 @@ class MonitorService:
                 if not pacote["novos"] and not pacote["normalizados"]:
                     continue
 
-                enviado = self._notificar_rele_agrupado(pacote)
-                if enviado:
+                ok_novos, ok_norm = self._notificar_rele_agrupado(pacote)
+                if pacote["novos"] and ok_novos:
                     for item in pacote["novos"]:
                         base = item.get("base")
                         if base:
                             self.rele_notificados.add(base)
-                    if pacote["normalizados"]:
+                if pacote["normalizados"]:
+                    if ok_norm:
                         bases_norm = {item.get("base") for item in pacote["normalizados"] if item.get("base")}
                         if bases_norm and usina_id in pend_norm:
-                            pend_norm[usina_id] = [i for i in pend_norm.get(usina_id, []) if i.get("base") not in bases_norm]
+                            pend_norm[usina_id] = [
+                                i for i in pend_norm.get(usina_id, []) if i.get("base") not in bases_norm
+                            ]
                             if not pend_norm[usina_id]:
                                 pend_norm.pop(usina_id, None)
-                else:
-                    if pacote["normalizados"]:
+                    else:
                         pend_list = pend_norm.setdefault(usina_id, [])
                         existentes = {i.get("base") for i in pend_list if i.get("base")}
                         for item in pacote["normalizados"]:
@@ -1397,50 +1399,71 @@ class MonitorService:
         except Exception:
             logger.exception("Falha ao enviar heartbeat")
 
-    # Monta e envia notificacao consolidada de alertas/normalizacoes de relé por usina.
+    # Monta e envia notificacao de falha/normalizacao de relé por usina.
     def _notificar_rele_agrupado(self, pacote):
         novos = pacote.get("novos", []) or []
         normalizados = pacote.get("normalizados", []) or []
         if not novos and not normalizados:
-            return False
+            return True, True
+
+        def _formatar_blocos(itens):
+            blocos = []
+            for it in itens:
+                blocos.append(
+                    "  \n".join(
+                        [
+                            f"Relé: {it.get('rele','N/A')}",
+                            f"Tipo: {it.get('tipo','N/A')}",
+                            f"Horário: {it.get('horario','?')}",
+                            f"Parâmetros: {it.get('parametros','')}",
+                        ]
+                    )
+                )
+            return "  \n  \n".join(blocos)
+
+        cap_txt = f"{pacote.get('capacidade','N/A')} kWp"
+        facts = [("Capacidade", cap_txt)]
+        usina = pacote.get("usina", "N/A")
         severos = {"SOBRETENSÃO", "TÉRMICO", "BLOQUEIO"}
-        severity = "danger" if any(i.get("tipo") in severos for i in novos) else "warning"
+        severity_falha = "danger" if any(i.get("tipo") in severos for i in novos) else "warning"
 
-        linhas = []
+        ok_novos = True
         if novos:
-            linhas.append("**Alertas novos:**")
-            for it in novos:
-                linhas.append(
-                    f"- **Relé:** {it['rele']} | **Tipo:** {it['tipo']} | "
-                    f"**Horário:** {it['horario']} | **Parâmetros:** {it['parametros']}"
-                )
-        if normalizados:
-            linhas.append("**Normalizados:**")
-            for it in normalizados:
-                linhas.append(
-                    f"- **Relé:** {it.get('rele','N/A')} | **Tipo:** {it.get('tipo','N/A')} | "
-                    f"**Horário:** {it.get('horario','?')} | **Parâmetros:** {it.get('parametros','')}"
-                )
-
-        texto = "\n".join(linhas)
-        logger_rele.warning(
-            f"[RELE] Usina: {pacote['usina']} | Novos: {len(novos)} | Normalizados: {len(normalizados)} | "
-            + " || ".join(l.replace(chr(10), " ") for l in linhas[1:])
-        )
-        try:
-            return _teams_post_card(
-                title=f"⚡ Relés - {pacote.get('usina','N/A')}",
-                text=texto,
-                severity=severity if novos else "info",
-                facts=[
-                    ("Capacidade", f"{pacote.get('capacidade','N/A')} kWp"),
-                    ("Alertas novos", str(len(novos))),
-                    ("Normalizados", str(len(normalizados))),
-                ],
+            texto = _formatar_blocos(novos)
+            logger_rele.warning(
+                f"[RELE] Falha | Usina: {usina} | Itens: {len(novos)} | "
+                + texto.replace("  \n", " | ")
             )
-        except Exception:
-            logger_rele.exception("Falha ao notificar Teams (rele consolidado)")
-            return False
+            try:
+                ok_novos = _teams_post_card(
+                    title=f"⚠️ Falha de relé - {usina}",
+                    text=f"  \n{texto}",
+                    severity=severity_falha,
+                    facts=facts,
+                )
+            except Exception:
+                logger_rele.exception("Falha ao notificar Teams (rele falha)")
+                ok_novos = False
+
+        ok_norm = True
+        if normalizados:
+            texto = _formatar_blocos(normalizados)
+            logger_rele.info(
+                f"[RELE] Normalizacao | Usina: {usina} | Itens: {len(normalizados)} | "
+                + texto.replace("  \n", " | ")
+            )
+            try:
+                ok_norm = _teams_post_card(
+                    title=f"✔️ Normalização de relé - {usina}",
+                    text=f"  \n{texto}",
+                    severity="info",
+                    facts=facts,
+                )
+            except Exception:
+                logger_rele.exception("Falha ao notificar Teams (rele normalizacao)")
+                ok_norm = False
+
+        return ok_novos, ok_norm
 
     # Monta mensagem de falha de inversor (Pac zerado) e envia para Teams.
     def _notificar_inversor(self, alerta):
