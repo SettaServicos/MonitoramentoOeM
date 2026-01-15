@@ -1369,20 +1369,21 @@ class MonitorService:
                 inv_usina_counts[nome] = inv_usina_counts.get(nome, 0) + 1
 
         info = [
-            f"**Status:** OK",
-            f"**Última varredura relé:** {ultima_rele.strftime('%d/%m %H:%M:%S') if ultima_rele else 'N/D'}",
-            f"**Última varredura inversor:** {ultima_inv.strftime('%d/%m %H:%M:%S') if ultima_inv else 'N/D'}",
-            f"**Host/PID:** {socket.gethostname()} / {os.getpid()}",
-            f"**Heartbeat previsto:** {previsto.strftime('%d/%m %H:%M')}",
-            f"**Alertas de relé ativos:** {ativos_rele}",
+            "Heartbeat: monitor rodando",
+            "Status: OK",
+            f"Última varredura relé: {ultima_rele.strftime('%d/%m %H:%M:%S') if ultima_rele else 'N/D'}",
+            f"Última varredura inversor: {ultima_inv.strftime('%d/%m %H:%M:%S') if ultima_inv else 'N/D'}",
+            f"Host/PID: {socket.gethostname()} / {os.getpid()}",
+            f"Heartbeat previsto: {previsto.strftime('%d/%m %H:%M')}",
+            f"Alertas de relé ativos: {ativos_rele}",
         ]
         if rele_usinas:
             for nome in rele_usinas:
-                info.append(f"  - {nome}")
-        info.append(f"**Alertas de inversor ativos:** {ativos_inv}")
+                info.append(f"  {nome}")
+        info.append(f"Alertas de inversor ativos: {ativos_inv}")
         if inv_usina_counts:
             for nome in sorted(inv_usina_counts):
-                info.append(f"  - {nome} ({inv_usina_counts[nome]})")
+                info.append(f"  {nome} ({inv_usina_counts[nome]})")
         texto = "  \n".join(info)
         logger.info(f"[HEARTBEAT] {texto.replace('  \n', ' | ')}")
         try:
