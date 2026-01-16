@@ -1379,11 +1379,11 @@ class MonitorService:
         ]
         if rele_usinas:
             for nome in rele_usinas:
-                info.append(f"  {nome}")
+                info.append(f"    • {nome}")
         info.append(f"Alertas de inversor ativos: {ativos_inv}")
         if inv_usina_counts:
             for nome in sorted(inv_usina_counts):
-                info.append(f"  {nome} ({inv_usina_counts[nome]})")
+                info.append(f"    • {nome} ({inv_usina_counts[nome]})")
         texto = "  \n".join(info)
         logger.info(f"[HEARTBEAT] {texto.replace('  \n', ' | ')}")
         try:
