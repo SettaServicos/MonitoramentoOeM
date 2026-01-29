@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # ===========================================
 # Monitor de Relés/Inversores (headless, Teams)
 # - Sem UI/monitor; roda em servidor e envia alertas para Teams.
@@ -14,6 +15,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import threading
 from datetime import datetime, timedelta, time as dtime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from requests import Session
 from requests.exceptions import Timeout
@@ -57,6 +59,10 @@ HEARTBEAT_TIMES = [
     dtime(20, 0),
     dtime(23, 0)
 ]
+
+# Limites para evitar crescimento indefinido do state.
+MAX_PENDING_RELE_POR_USINA = 200
+MAX_PENDING_INV = 400
 
 # alias para compatibilidade interna
 BASE_URL = PVOP_BASE_URL
@@ -200,6 +206,8 @@ class PVOperationAPI:
         self.session.verify = self._verify
         self.token = None
         self.headers = {}
+        self.last_get_plants_timeout = False
+        self.last_get_plants_error = False
         self._login()
 
     def _reset_session(self):
@@ -209,6 +217,106 @@ class PVOperationAPI:
             pass
         self.session = Session()
         self.session.verify = self._verify
+
+    def _retry_after_seconds(self, response):
+        retry_after = response.headers.get("Retry-After")
+        if not retry_after:
+            return None
+        try:
+            return max(0, int(retry_after))
+        except (TypeError, ValueError):
+            pass
+        try:
+            parsed = parsedate_to_datetime(retry_after)
+        except Exception:
+            return None
+        if not parsed:
+            return None
+        now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+        delta = (parsed - now).total_seconds()
+        return max(0, int(delta))
+
+    def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers=None,
+        json_payload=None,
+        timeout: int = 20,
+        max_tentativas: int = 3,
+        backoff_base: int = 2,
+        contexto: str = "",
+        reauth_on_401: bool = False,
+        retry_on_status=None,
+        log_status: bool = True,
+        conn_error_suffix: str = "Tentando recriar sessão.",
+    ):
+        def _should_retry(status_code: int) -> bool:
+            if retry_on_status is None:
+                return status_code == 429 or 500 <= status_code <= 599
+            if callable(retry_on_status):
+                return retry_on_status(status_code)
+            return status_code in retry_on_status
+
+        for tentativa in range(1, max_tentativas + 1):
+            try:
+                req_headers = headers if headers is not None else self.headers
+                resp = self.session.request(
+                    method,
+                    url,
+                    headers=req_headers,
+                    json=json_payload,
+                    timeout=timeout,
+                )
+            except Timeout:
+                logger.warning(
+                    f"Timeout em {contexto} - tentativa {tentativa}/{max_tentativas}."
+                )
+                if tentativa == max_tentativas:
+                    return None, True
+                time.sleep(backoff_base * tentativa)
+                continue
+            except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
+                logger.warning(
+                    f"Erro de conexão em {contexto}: {e}. {conn_error_suffix}"
+                )
+                self._reset_session()
+                if not self._login():
+                    return None, False
+                if tentativa == max_tentativas:
+                    return None, False
+                time.sleep(backoff_base * tentativa)
+                continue
+            except Exception as e:
+                logger.error(f"Erro em {contexto}: {e}")
+                return None, False
+
+            if resp.status_code == 401 and reauth_on_401:
+                if not self.verificar_token():
+                    return None, False
+                time.sleep(1)
+                continue
+
+            if _should_retry(resp.status_code):
+                if log_status:
+                    logger.warning(
+                        f"Status {resp.status_code} em {contexto} - tentativa {tentativa}/{max_tentativas}."
+                    )
+                if tentativa == max_tentativas:
+                    return resp, False
+                if resp.status_code == 429:
+                    espera = self._retry_after_seconds(resp)
+                    if espera is None:
+                        espera = min(backoff_base ** tentativa, 10)
+                else:
+                    espera = backoff_base * tentativa
+                time.sleep(espera)
+                continue
+
+            return resp, False
+
+        return None, False
 
     # Executa login na API para obter token JWT e cabecalhos de autorizacao.
     def _login(self) -> bool:
@@ -248,80 +356,53 @@ class PVOperationAPI:
     # Recupera lista de plantas tratando expiracao de sessao e reconexao.
     def get_plants(self):
         url = f"{self.base_url}/plants"
-        try:
-            r = self.session.get(url, headers=self.headers, timeout=20)
-            if r.status_code == 401:
-                if not self.verificar_token():
-                    return []
-                r = self.session.get(url, headers=self.headers, timeout=20)
-            if r.status_code == 200:
-                return r.json() or []
-            logger.error(f"Erro ao buscar plantas. Status: {r.status_code}")
-        except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
-            logger.warning(f"Erro de conexão em get_plants: {e}. Tentando recriar sessão e reautenticar.")
-            self._reset_session()
-            if self._login():
-                try:
-                    r = self.session.get(url, headers=self.headers, timeout=20)
-                    if r.status_code == 200:
-                        return r.json() or []
-                except Exception as e2:
-                    logger.error(f"Falha ao repetir get_plants após recriar sessão: {e2}")
-        except Exception as e:
-            logger.error(f"Exceção em get_plants: {e}")
-        return []
+        self.last_get_plants_timeout = False
+        self.last_get_plants_error = False
+        r, timeout_flag = self._request_with_retry(
+            "get",
+            url,
+            timeout=20,
+            max_tentativas=3,
+            backoff_base=2,
+            contexto="get_plants",
+            reauth_on_401=True,
+            retry_on_status=None,
+            log_status=False,
+            conn_error_suffix="Tentando recriar sessão e reautenticar.",
+        )
+        if r is None:
+            self.last_get_plants_timeout = bool(timeout_flag)
+            self.last_get_plants_error = True
+            return None
+        if r.status_code == 200:
+            return r.json() or []
+        logger.error(f"Erro ao buscar plantas. Status: {r.status_code}")
+        self.last_get_plants_error = True
+        return None
 
     # Faz chamada para endpoint diario (day_*) com retry e backoff exponencial leve.
     def post_day(self, endpoint: str, plant_id: int, date: datetime):
         """Chama endpoints day_* com retry/backoff. Retorna (dados ou None, timeout_flag)."""
         payload = {"id": int(plant_id), "date": date.strftime("%Y-%m-%d")}
         url = f"{self.base_url}/{endpoint}"
-        max_tentativas = 3
-        backoff_base = 2
-
-        for tentativa in range(1, max_tentativas + 1):
-            try:
-                r = self.session.post(url, json=payload, headers=self.headers, timeout=30)
-            except Timeout:
-                logger.warning(
-                    f"Timeout em {endpoint} (usina {plant_id}, {date.date()}) - "
-                    f"tentativa {tentativa}/{max_tentativas}."
-                )
-                if tentativa == max_tentativas:
-                    return None, True
-                time.sleep(backoff_base * tentativa)
-                continue
-            except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
-                logger.warning(
-                    f"Erro de conexão em {endpoint} (usina {plant_id}): {e}. Tentando recriar sessão."
-                )
-                self._reset_session()
-                if not self._login():
-                    return None, False
-                if tentativa == max_tentativas:
-                    return None, False
-                time.sleep(backoff_base * tentativa)
-                continue
-            except Exception as e:
-                logger.error(f"Erro em {endpoint}: {e}")
-                return None, False
-
-            if r.status_code == 401:
-                if not self.verificar_token():
-                    return None, False
-                time.sleep(1)
-                continue
-
-            if r.status_code == 200:
-                return r.json(), False
-
-            logger.warning(
-                f"Status {r.status_code} em {endpoint} (usina {plant_id}, {date.date()}) - "
-                f"tentativa {tentativa}/{max_tentativas}."
-            )
-            if tentativa == max_tentativas:
-                return None, False
-            time.sleep(backoff_base * tentativa)
+        contexto = f"{endpoint} (usina {plant_id}, {date.date()})"
+        r, timeout_flag = self._request_with_retry(
+            "post",
+            url,
+            json_payload=payload,
+            timeout=30,
+            max_tentativas=3,
+            backoff_base=2,
+            contexto=contexto,
+            reauth_on_401=True,
+            retry_on_status=lambda status: status == 408 or status == 429 or 500 <= status <= 599,
+            log_status=True,
+            conn_error_suffix="Tentando recriar sessão.",
+        )
+        if r is None:
+            return None, timeout_flag
+        if r.status_code == 200:
+            return r.json(), False
         return None, False
 
 
@@ -378,7 +459,7 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
         "rRL4","rRL5","rRR","r49","r49_2"
     }
 
-    candidatos = []
+    agrupados = {}
     tem_dados = False
     tem_resposta = False
     teve_timeout = False
@@ -393,7 +474,10 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
             continue
 
         if isinstance(data_resp, list):
-            tem_dados = True
+            if data_resp:
+                tem_dados = True
+            else:
+                tem_resposta = True
         else:
             logger_rele.warning(f"Resposta inesperada em day_relay (usina {plant_id}): {type(data_resp).__name__}")
             d += timedelta(days=1)
@@ -430,19 +514,33 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
                     tipo = classe
                     break
 
-            candidatos.append(
-                {
+            base = f"{plant_id}:{idrele}:{tipo}"
+            entry = agrupados.get(base)
+            if not entry:
+                agrupados[base] = {
                     "ts_leitura": ts,
+                    "ts_primeiro": ts,
+                    "ts_ultimo": ts,
                     "rele_id": idrele,
-                    "parametros": ", ".join(sorted(ativos)),
+                    "parametros_set": set(ativos),
                     "tipo_alerta": tipo,
                 }
-            )
+            else:
+                if ts < entry["ts_primeiro"]:
+                    entry["ts_primeiro"] = ts
+                if ts > entry["ts_ultimo"]:
+                    entry["ts_ultimo"] = ts
+                entry["parametros_set"].update(ativos)
         d += timedelta(days=1)
 
-    if not candidatos:
+    if not agrupados:
         return [], tem_dados, teve_timeout
 
+    candidatos = []
+    for entry in agrupados.values():
+        entry["ts_leitura"] = entry["ts_ultimo"]
+        entry["parametros"] = ", ".join(sorted(entry.pop("parametros_set")))
+        candidatos.append(entry)
     candidatos.sort(key=lambda a: a["ts_leitura"])
     return candidatos, tem_dados, teve_timeout
 
@@ -663,10 +761,17 @@ class MonitorService:
                 logger.warning(f"Thread ainda ativa apos timeout de stop: {t.name}")
                 threads_vivas.append(t)
         if threads_vivas:
-            logger.warning("Lock mantido porque ainda existem threads ativas.")
-            return
-        self._save_state()
-        self._release_lock()
+            logger.warning("Threads ainda ativas; forçando persistência e liberação do lock.")
+        acquired_scan = False
+        try:
+            acquired_scan = self._scan_lock.acquire(timeout=STOP_JOIN_TIMEOUT)
+            if not acquired_scan:
+                logger.warning("Nao foi possivel obter scan lock para snapshot; salvando estado mesmo assim.")
+            self._save_state()
+        finally:
+            if acquired_scan:
+                self._scan_lock.release()
+            self._release_lock()
 
     # Cria lock de arquivo para evitar multiplas instancias simultaneas.
     def _acquire_lock(self):
@@ -675,14 +780,14 @@ class MonitorService:
             self._lock_fd.seek(0)
             if os.name == "nt":
                 if not msvcrt:
-                    raise RuntimeError("Lock de Windows nÇœo disponÇ­vel (msvcrt ausente).")
+                    raise RuntimeError("Lock de Windows não disponível (msvcrt ausente).")
                 try:
                     msvcrt.locking(self._lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
                 except OSError:
-                    raise BlockingIOError("Lock jÇ  ativa em Windows.")
+                    raise BlockingIOError("Lock já ativa em Windows.")
             else:
                 if not fcntl:
-                    raise RuntimeError("Lock de Unix nÇœo disponÇ­vel (fcntl ausente).")
+                    raise RuntimeError("Lock de Unix não disponível (fcntl ausente).")
                 fcntl.lockf(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self._lock_fd.seek(0)
             self._lock_fd.truncate(0)
@@ -724,6 +829,19 @@ class MonitorService:
         except Exception as e:
             logger.warning(f"Falha ao criar backup do state corrompido: {e}")
             return None
+
+    def _limitar_pendencias(self):
+        pend_rele = self.pending_notifications.get("rele_normalizados", {})
+        if isinstance(pend_rele, dict):
+            for usina_id, itens in list(pend_rele.items()):
+                if not isinstance(itens, list):
+                    continue
+                if len(itens) > MAX_PENDING_RELE_POR_USINA:
+                    pend_rele[usina_id] = itens[-MAX_PENDING_RELE_POR_USINA:]
+        pend_inv = self.pending_notifications.get("inv_normalizados", {})
+        if isinstance(pend_inv, dict) and len(pend_inv) > MAX_PENDING_INV:
+            for chave in list(pend_inv.keys())[:-MAX_PENDING_INV]:
+                pend_inv.pop(chave, None)
 
     # Carrega estado de ultima varredura e listas de alertas persistidos em disco.
     def _load_state(self):
@@ -853,6 +971,7 @@ class MonitorService:
                         self.estado_inversores[estado_key] = entry
             # recalcula usinas com rele ativo a partir do estado persistido
             self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
+            self._limitar_pendencias()
             logger.info("Estado carregado do disco.")
         except (json.JSONDecodeError, ValueError) as e:
             self._backup_corrupt_state(str(e))
@@ -864,6 +983,7 @@ class MonitorService:
     # Salva em disco o ponto de controle atual das varreduras e alertas ativos.
     def _save_state(self):
         try:
+            self._limitar_pendencias()
             payload = {
                 "schema_version": STATE_SCHEMA_VERSION,
                 "ultima_varredura_rele": self.ultima_varredura_rele.isoformat() if self.ultima_varredura_rele else None,
@@ -913,7 +1033,8 @@ class MonitorService:
             if self.stop_event.wait(espera):
                 break
 
-    def _loop_rele(self):
+    def _loop_rele(self):  # pragma: no cover
+        """LEGACY/DEPRECATED: use _loop_scans; mantido por compatibilidade."""
         while not self.stop_event.is_set():
             try:
                 self.executar_varredura_rele()
@@ -922,7 +1043,8 @@ class MonitorService:
             self.stop_event.wait(RELAY_INTERVAL)
 
     # Loop continuo que dispara varredura de inversores no intervalo definido.
-    def _loop_inversor(self):
+    def _loop_inversor(self):  # pragma: no cover
+        """LEGACY/DEPRECATED: use _loop_scans; mantido por compatibilidade."""
         while not self.stop_event.is_set():
             try:
                 self.executar_varredura_inversor()
@@ -955,9 +1077,22 @@ class MonitorService:
             logger_rele.info("Varredura de rele iniciada.")
             sem_plantas = False
             pend_norm = self.pending_notifications.setdefault("rele_normalizados", {})
+            teve_erro_api = False
+            teve_timeout_api = False
 
             plantas = self.api_rele.get_plants()
-            if not plantas:
+            if plantas is None:
+                teve_erro_api = True
+                teve_timeout_api = bool(self.api_rele.last_get_plants_timeout)
+                motivo = "TIMEOUT" if teve_timeout_api else "ERRO_API"
+                logger_rele.warning(
+                    f"Erro ao buscar plantas (rele). Motivo: {motivo}. Mantendo alertas ativos."
+                )
+                # mantem/recalcula bloqueios a partir dos alertas ativos conhecidos
+                self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
+                sem_plantas = True
+                plantas = []
+            elif not plantas:
                 logger_rele.warning("Nenhuma usina encontrada (rele).")
                 # mantem/recalcula bloqueios a partir dos alertas ativos conhecidos
                 self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
@@ -1155,6 +1290,8 @@ class MonitorService:
             logger_inv.info("Varredura de inversor iniciada.")
             sem_plantas = False
             pend_norm = self.pending_notifications.setdefault("inv_normalizados", {})
+            teve_erro_api = False
+            teve_timeout_api = False
 
             def _reenviar_normalizacoes_pendentes():
                 if not pend_norm:
@@ -1172,7 +1309,14 @@ class MonitorService:
                         pend_norm.pop(chave, None)
 
             plantas = self.api_inversor.get_plants()
-            if not plantas:
+            if plantas is None:
+                teve_erro_api = True
+                teve_timeout_api = bool(self.api_inversor.last_get_plants_timeout)
+                motivo = "TIMEOUT" if teve_timeout_api else "ERRO_API"
+                logger_inv.warning(f"Erro ao buscar plantas (inversor). Motivo: {motivo}.")
+                sem_plantas = True
+                plantas = []
+            elif not plantas:
                 logger_inv.warning("Nenhuma usina encontrada (inversor).")
                 sem_plantas = True
                 plantas = []
@@ -1188,7 +1332,6 @@ class MonitorService:
                 if usina_id in self.usinas_alerta_rele_recente:
                     logger_inv.info(f"Pulando inversores de {p.get('nome')} devido a alerta de rele recente.")
                     # Regra oficial: com relé ativo, pausa inversores sem alterar estado.
-                    self.ultima_varredura_inversor_por_usina[usina_id] = agora
                     continue
 
                 nome = p.get("nome")
@@ -1375,15 +1518,18 @@ class MonitorService:
             f"Última varredura inversor: {ultima_inv.strftime('%d/%m %H:%M:%S') if ultima_inv else 'N/D'}",
             f"Host/PID: {socket.gethostname()} / {os.getpid()}",
             f"Heartbeat previsto: {previsto.strftime('%d/%m %H:%M')}",
-            f"Alertas de relé ativos: {ativos_rele}",
+            "",
+            f"**Alertas de relé ativos: {ativos_rele}**",
         ]
+        bullet_prefix = "    • "
         if rele_usinas:
             for nome in rele_usinas:
-                info.append(f"    • {nome}")
-        info.append(f"Alertas de inversor ativos: {ativos_inv}")
+                info.append(f"{bullet_prefix}{nome}")
+        info.append("")
+        info.append(f"**Alertas de inversor ativos: {ativos_inv}**")
         if inv_usina_counts:
             for nome in sorted(inv_usina_counts):
-                info.append(f"    • {nome} ({inv_usina_counts[nome]})")
+                info.append(f"{bullet_prefix}{nome} ({inv_usina_counts[nome]})")
         texto = "  \n".join(info)
         logger.info(f"[HEARTBEAT] {texto.replace('  \n', ' | ')}")
         try:
@@ -1552,3 +1698,7 @@ def main():
 # Executa a aplicacao somente quando o arquivo for chamado diretamente.
 if __name__ == "__main__":
     main()
+
+# sanity check:
+# - Alertas de rele: ts_primeiro/ts_ultimo adicionados e parametros agregados sem duplicatas; ts_leitura aponta para o ultimo evento.
+# - PVOperationAPI._request_with_retry faz retry/backoff em Timeout, ConnectionError/RequestException, HTTP 5xx e 429 (Retry-After quando presente).
