@@ -15,7 +15,7 @@ Este projeto consiste em um monitor Python headless, projetado para operar 24 ho
 *   **Resiliência:** Mecanismos de retry com backoff para chamadas de API e envio de notificações para o Teams.
 *   **Instância Única:** Garante que apenas uma instância do monitor esteja em execução por vez.
 
-## 3. Como Funciona (Arquitetura em Alto Nível)
+## 3. Como Funciona (Arquitetura)
 
 O monitor opera com uma arquitetura baseada em threads e persistência de estado:
 
