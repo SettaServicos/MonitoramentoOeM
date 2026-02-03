@@ -148,12 +148,12 @@ def validate_config():
         raise SystemExit(
             "Configuracao obrigatoria ausente ou placeholder: "
             + ", ".join(missing)
-            + ". Edite a secao CONFIGURACAO no topo do maindebug.py."
+            + ". Edite a secao CONFIGURACAO no topo do main.py."
         )
     if TEAMS_ENABLED and _is_placeholder(TEAMS_WEBHOOK_URL):
         raise SystemExit(
             "TEAMS_ENABLED=True, mas TEAMS_WEBHOOK_URL esta ausente ou placeholder. "
-            "Edite a secao CONFIGURACAO no topo do maindebug.py."
+            "Edite a secao CONFIGURACAO no topo do main.py."
         )
 
 # Envia cartao padrao (MessageCard) para Teams quando alertas ocorrem.
@@ -161,6 +161,24 @@ def _teams_post_card(title, text, severity="info", facts=None):
     """Envia um 'MessageCard' para um Incoming Webhook do Microsoft Teams."""
     if not TEAMS_ENABLED:
         return False
+    def _retry_after_seconds(resp):
+        retry_after = resp.headers.get("Retry-After")
+        if not retry_after:
+            return None
+        try:
+            return max(0, int(retry_after))
+        except (TypeError, ValueError):
+            pass
+        try:
+            parsed = parsedate_to_datetime(retry_after)
+        except Exception:
+            return None
+        if not parsed:
+            return None
+        now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+        delta = (parsed - now).total_seconds()
+        return max(0, int(delta))
+
     colors = {"info": "0078D4", "warning": "FFA000", "danger": "D13438"}
     payload = {
         "@type": "MessageCard",
@@ -182,6 +200,15 @@ def _teams_post_card(title, text, severity="info", facts=None):
                 headers={"Content-Type": "application/json"},
                 timeout=10,
             )
+            if r.status_code == 429:
+                espera = _retry_after_seconds(r)
+                if espera is not None:
+                    espera = min(max(0, espera), 60)
+                    if tentativa == max_tentativas:
+                        logger.warning("[TEAMS] Rate limit (429) excedeu tentativas.")
+                        return False
+                    time.sleep(espera)
+                    continue
             r.raise_for_status()
             return True
         except Exception as e:
@@ -283,7 +310,10 @@ class PVOperationAPI:
                 )
                 self._reset_session()
                 if not self._login():
-                    return None, False
+                    if tentativa == max_tentativas:
+                        return None, False
+                    time.sleep(backoff_base * tentativa)
+                    continue
                 if tentativa == max_tentativas:
                     return None, False
                 time.sleep(backoff_base * tentativa)
@@ -764,7 +794,7 @@ class MonitorService:
             logger.warning("Threads ainda ativas; forçando persistência e liberação do lock.")
         acquired_scan = False
         try:
-            acquired_scan = self._scan_lock.acquire(timeout=STOP_JOIN_TIMEOUT)
+            acquired_scan = self._scan_lock.acquire(timeout=1)
             if not acquired_scan:
                 logger.warning("Nao foi possivel obter scan lock para snapshot; salvando estado mesmo assim.")
             self._save_state()
