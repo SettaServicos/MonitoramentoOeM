@@ -66,6 +66,22 @@ SOLAR_WINDOW_END = dtime(17, 30)
 SOLAR_WINDOW_LABEL = f"{SOLAR_WINDOW_START.strftime('%H:%M')}-{SOLAR_WINDOW_END.strftime('%H:%M')}"
 WEEKLY_REPORT_CHECK_INTERVAL = 300
 WEEKLY_REPORT_GENERATION_TIME = dtime(0, 5)
+WEEKLY_REPORT_WARMUP_DAYS = 1
+
+RELAY_PARAMS_CLASSIF = {
+    "SOBRETENSÃO": {"r59A", "r59B", "r59C", "r59N"},
+    "SUBTENSÃO": {"r27A", "r27B", "r27C", "r27_0"},
+    "FREQUÊNCIA": {"r81O", "r81U"},
+    "TÉRMICO": {"r49", "r49_2"},
+    "BLOQUEIO": {"rAR", "rBA", "rDO"},
+}
+RELAY_PARAMETROS = {
+    "r27A","r27B","r27C","r27_0","r32A","r32A_2","r32B","r32B_2","r32C","r32C_2",
+    "r46Q","r47","r59A","r59B","r59C","r59N","r67A","r67A_2","r67B","r67B_2",
+    "r67C","r67C_2","r67N_1","r67N_2","r78","r81O","r81U","r86","rAR","rBA",
+    "rDO","rEPwd","rERLS","rEl2t","rFR","rGS","rHLT","rRL1","rRL2","rRL3",
+    "rRL4","rRL5","rRR","r49","r49_2"
+}
 
 # Limites para evitar crescimento indefinido do state.
 MAX_PENDING_RELE_POR_USINA = 200
@@ -642,20 +658,8 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
                 return False
         return False
 
-    PARAMS_CLASSIF = {
-        "SOBRETENSÃO": {"r59A", "r59B", "r59C", "r59N"},
-        "SUBTENSÃO": {"r27A", "r27B", "r27C", "r27_0"},
-        "FREQUÊNCIA": {"r81O", "r81U"},
-        "TÉRMICO": {"r49", "r49_2"},
-        "BLOQUEIO": {"rAR", "rBA", "rDO"},
-    }
-    PARAMETROS_RELE = {
-        "r27A","r27B","r27C","r27_0","r32A","r32A_2","r32B","r32B_2","r32C","r32C_2",
-        "r46Q","r47","r59A","r59B","r59C","r59N","r67A","r67A_2","r67B","r67B_2",
-        "r67C","r67C_2","r67N_1","r67N_2","r78","r81O","r81U","r86","rAR","rBA",
-        "rDO","rEPwd","rERLS","rEl2t","rFR","rGS","rHLT","rRL1","rRL2","rRL3",
-        "rRL4","rRL5","rRR","r49","r49_2"
-    }
+    PARAMS_CLASSIF = RELAY_PARAMS_CLASSIF
+    PARAMETROS_RELE = RELAY_PARAMETROS
 
     agrupados = {}
     tem_dados = False
@@ -1512,6 +1516,212 @@ class MonitorService:
             return valor.strftime("%d/%m/%Y %H:%M:%S")
         return ""
 
+    @staticmethod
+    def _valor_rele_ativo_relatorio(valor):
+        if isinstance(valor, bool):
+            return valor
+        if isinstance(valor, (int, float)):
+            return valor == 1
+        if isinstance(valor, str):
+            txt = valor.strip().lower()
+            if txt in {"true", "1"}:
+                return True
+            try:
+                return float(txt) == 1.0
+            except Exception:
+                return False
+        return False
+
+    def _classificar_rele_conteudo_relatorio(self, conteudo):
+        if not isinstance(conteudo, dict):
+            return None
+        ativos = [p for p in RELAY_PARAMETROS if self._valor_rele_ativo_relatorio(conteudo.get(p))]
+        if not ativos:
+            return None
+        tipo = "OUTROS"
+        for classe, lista in RELAY_PARAMS_CLASSIF.items():
+            if any(p in lista for p in ativos):
+                tipo = classe
+                break
+        return tipo
+
+    def _coletar_incidentes_rele_semana_api(self, usina_id: str, usina_nome: str, inicio_semana: datetime, fim_semana: datetime):
+        inicio_busca = inicio_semana - timedelta(days=WEEKLY_REPORT_WARMUP_DAYS)
+        fim_busca = fim_semana - timedelta(seconds=1)
+        leituras_por_rele = defaultdict(list)
+
+        dia = inicio_busca.date()
+        while dia <= fim_busca.date():
+            data_resp, timeout_flag = self.api_rele.post_day("day_relay", int(usina_id), datetime.combine(dia, datetime.min.time()))
+            if timeout_flag:
+                logger_rele.warning(
+                    f"Timeout parcial no backfill semanal de rele (usina {usina_id}, dia {dia})."
+                )
+            if data_resp is None:
+                dia += timedelta(days=1)
+                continue
+            if not isinstance(data_resp, list):
+                dia += timedelta(days=1)
+                continue
+            for registro in data_resp:
+                if not isinstance(registro, dict):
+                    continue
+                conteudo = registro.get("conteudojson")
+                if not isinstance(conteudo, dict):
+                    continue
+                rele_id = registro.get("idrele")
+                if not rele_id:
+                    continue
+                try:
+                    ts = datetime.strptime(conteudo.get("tsleitura", ""), "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    continue
+                if ts < inicio_busca or ts > fim_busca:
+                    continue
+                tipo = self._classificar_rele_conteudo_relatorio(conteudo)
+                leituras_por_rele[str(rele_id)].append((ts, tipo))
+            dia += timedelta(days=1)
+
+        incidentes = []
+        for rele_id, itens in leituras_por_rele.items():
+            itens.sort(key=lambda x: x[0])
+            tipo_ativo = None
+            inicio_ativo = None
+            for ts, tipo_atual in itens:
+                if tipo_ativo is None:
+                    if tipo_atual:
+                        tipo_ativo = tipo_atual
+                        inicio_ativo = ts
+                    continue
+                if tipo_atual == tipo_ativo:
+                    continue
+                incidentes.append(
+                    {
+                        "chave": f"{usina_id}:{rele_id}:{tipo_ativo}",
+                        "natureza": "RELE",
+                        "tipo_falha": tipo_ativo,
+                        "usina_id": str(usina_id),
+                        "usina": usina_nome or f"Usina {usina_id}",
+                        "equipamento": str(rele_id),
+                        "inicio_ts": (inicio_ativo or ts).isoformat(),
+                        "fim_ts": ts.isoformat(),
+                    }
+                )
+                tipo_ativo = tipo_atual
+                inicio_ativo = ts if tipo_atual else None
+
+            if tipo_ativo:
+                incidentes.append(
+                    {
+                        "chave": f"{usina_id}:{rele_id}:{tipo_ativo}",
+                        "natureza": "RELE",
+                        "tipo_falha": tipo_ativo,
+                        "usina_id": str(usina_id),
+                        "usina": usina_nome or f"Usina {usina_id}",
+                        "equipamento": str(rele_id),
+                        "inicio_ts": (inicio_ativo or inicio_semana).isoformat(),
+                        "fim_ts": None,
+                    }
+                )
+        return incidentes
+
+    def _coletar_incidentes_inversor_semana_api(self, usina_id: str, usina_nome: str, inicio_semana: datetime, fim_semana: datetime):
+        inicio_busca = inicio_semana - timedelta(days=WEEKLY_REPORT_WARMUP_DAYS)
+        fim_busca = fim_semana - timedelta(seconds=1)
+        falhas, recuperados, _, _, _ = detectar_falhas_inversores(
+            self.api_inversor, usina_id, inicio_busca, fim_busca, {}
+        )
+        eventos = []
+        for falha in falhas:
+            eventos.append(("falha", falha.get("ts_leitura"), falha))
+        for rec in recuperados:
+            eventos.append(("rec", rec.get("ts_leitura"), rec))
+        eventos = [e for e in eventos if isinstance(e[1], datetime)]
+        eventos.sort(key=lambda item: item[1])
+
+        ativos = {}
+        incidentes = []
+        for tipo, ts, item in eventos:
+            inv_id = str(item.get("inversor_id"))
+            if not inv_id:
+                continue
+            chave = f"{usina_id}:{inv_id}"
+            if tipo == "falha":
+                ativos.setdefault(chave, ts)
+                continue
+            inicio_inc = ativos.pop(chave, inicio_semana)
+            if ts < inicio_inc:
+                inicio_inc = ts
+            incidentes.append(
+                {
+                    "chave": chave,
+                    "natureza": "INVERSOR",
+                    "tipo_falha": "PAC=0 (3 leituras consecutivas)",
+                    "usina_id": str(usina_id),
+                    "usina": usina_nome or f"Usina {usina_id}",
+                    "equipamento": inv_id,
+                    "inicio_ts": inicio_inc.isoformat(),
+                    "fim_ts": ts.isoformat(),
+                }
+            )
+
+        for chave, inicio_inc in ativos.items():
+            inv_id = chave.split(":", 1)[1] if ":" in chave else chave
+            incidentes.append(
+                {
+                    "chave": chave,
+                    "natureza": "INVERSOR",
+                    "tipo_falha": "PAC=0 (3 leituras consecutivas)",
+                    "usina_id": str(usina_id),
+                    "usina": usina_nome or f"Usina {usina_id}",
+                    "equipamento": inv_id,
+                    "inicio_ts": inicio_inc.isoformat(),
+                    "fim_ts": None,
+                }
+            )
+        return incidentes
+
+    def _coletar_incidentes_semana_api(self, inicio_semana: datetime, fim_semana: datetime):
+        plantas = self.api_rele.get_plants()
+        if not plantas:
+            return None
+
+        incidentes = []
+        for p in plantas:
+            usina_id_raw = p.get("id")
+            try:
+                usina_id = str(int(usina_id_raw))
+            except (TypeError, ValueError):
+                continue
+            usina_nome = p.get("nome")
+            try:
+                incidentes.extend(
+                    self._coletar_incidentes_rele_semana_api(
+                        usina_id=usina_id,
+                        usina_nome=usina_nome,
+                        inicio_semana=inicio_semana,
+                        fim_semana=fim_semana,
+                    )
+                )
+            except Exception as e:
+                logger_rele.warning(
+                    f"Falha no backfill semanal de rele para usina {usina_id}: {e}"
+                )
+            try:
+                incidentes.extend(
+                    self._coletar_incidentes_inversor_semana_api(
+                        usina_id=usina_id,
+                        usina_nome=usina_nome,
+                        inicio_semana=inicio_semana,
+                        fim_semana=fim_semana,
+                    )
+                )
+            except Exception as e:
+                logger_inv.warning(
+                    f"Falha no backfill semanal de inversor para usina {usina_id}: {e}"
+                )
+        return incidentes
+
     def _montar_relatorio_semanal(self, inicio_semana: datetime, fim_semana: datetime, historico, ativos_rele, ativos_inv):
         ocorrencias = []
         dedupe = set()
@@ -1568,8 +1778,7 @@ class MonitorService:
         for it in ocorrencias:
             chave = (it["usina"], it["natureza"], it["tipo_falha"])
             agg = agregados[chave]
-            if inicio_semana <= it["inicio"] < fim_semana:
-                agg["qtd"] += 1
+            agg["qtd"] += 1
             agg["dur_total_sec"] += it["dur_total_sec"]
             agg["dur_solar_sec"] += it["dur_solar_sec"]
 
@@ -1645,9 +1854,18 @@ class MonitorService:
             if not pendente:
                 return False
             inicio_semana, fim_semana, report_id = pendente
-            historico = list(self.historico_incidentes)
-            ativos_rele = dict(self.incidentes_rele_ativos)
-            ativos_inv = dict(self.incidentes_inv_ativos)
+            incidentes_api = self._coletar_incidentes_semana_api(inicio_semana, fim_semana)
+            if incidentes_api is None:
+                historico = list(self.historico_incidentes)
+                ativos_rele = dict(self.incidentes_rele_ativos)
+                ativos_inv = dict(self.incidentes_inv_ativos)
+                logger.warning(
+                    "Relatorio semanal usando fallback de state local (coleta direta da API indisponivel)."
+                )
+            else:
+                historico = incidentes_api
+                ativos_rele = {}
+                ativos_inv = {}
 
         resumo_rows, ocorrencias_rows, semana_txt = self._montar_relatorio_semanal(
             inicio_semana, fim_semana, historico, ativos_rele, ativos_inv
