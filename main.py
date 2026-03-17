@@ -66,7 +66,9 @@ SOLAR_WINDOW_END = dtime(17, 30)
 SOLAR_WINDOW_LABEL = f"{SOLAR_WINDOW_START.strftime('%H:%M')}-{SOLAR_WINDOW_END.strftime('%H:%M')}"
 WEEKLY_REPORT_CHECK_INTERVAL = 300
 WEEKLY_REPORT_GENERATION_TIME = dtime(0, 5)
-WEEKLY_REPORT_WARMUP_DAYS = 1
+# Usa uma semana extra para reconstruir estado na borda da semana sem aumentar
+# demais a carga da API; o state local continua como segunda fonte.
+WEEKLY_REPORT_WARMUP_DAYS = 7
 
 RELAY_PARAMS_CLASSIF = {
     "SOBRETENSÃO": {"r59A", "r59B", "r59C", "r59N"},
@@ -1683,8 +1685,10 @@ class MonitorService:
 
     def _coletar_incidentes_semana_api(self, inicio_semana: datetime, fim_semana: datetime):
         plantas = self.api_rele.get_plants()
-        if not plantas:
+        if plantas is None:
             return None
+        if not plantas:
+            return []
 
         incidentes = []
         for p in plantas:
@@ -1721,6 +1725,100 @@ class MonitorService:
                     f"Falha no backfill semanal de inversor para usina {usina_id}: {e}"
                 )
         return incidentes
+
+    def _coletar_incidentes_semana_state(self, inicio_semana: datetime, fim_semana: datetime):
+        incidentes = []
+        for item in list(self.historico_incidentes):
+            if not isinstance(item, dict):
+                continue
+            inicio_dt = _parse_iso_datetime(item.get("inicio_ts"))
+            if not inicio_dt:
+                continue
+            fim_dt = _parse_iso_datetime(item.get("fim_ts")) or fim_semana
+            if fim_dt <= inicio_semana or inicio_dt >= fim_semana:
+                continue
+            incidentes.append(dict(item))
+
+        for item in list(self.incidentes_rele_ativos.values()) + list(self.incidentes_inv_ativos.values()):
+            if not isinstance(item, dict):
+                continue
+            inicio_dt = _parse_iso_datetime(item.get("inicio_ts"))
+            if not inicio_dt:
+                continue
+            fim_dt = _parse_iso_datetime(item.get("fim_ts")) or fim_semana
+            if fim_dt <= inicio_semana or inicio_dt >= fim_semana:
+                continue
+            incidentes.append(dict(item))
+
+        return incidentes
+
+    @staticmethod
+    def _incidente_overlap_key(item):
+        return (
+            str(item.get("natureza", "")),
+            str(item.get("usina_id", "")),
+            str(item.get("equipamento", "")),
+            str(item.get("tipo_falha", "")),
+        )
+
+    @staticmethod
+    def _intervalos_se_sobrepoem(inicio_a, fim_a, inicio_b, fim_b):
+        return inicio_a <= fim_b and inicio_b <= fim_a
+
+    def _mesclar_incidentes_relatorio(self, incidentes, fim_semana: datetime):
+        grupos = defaultdict(list)
+        for item in incidentes:
+            if not isinstance(item, dict):
+                continue
+            inicio_dt = _parse_iso_datetime(item.get("inicio_ts"))
+            if not inicio_dt:
+                continue
+            fim_dt = _parse_iso_datetime(item.get("fim_ts")) or fim_semana
+            if fim_dt < inicio_dt:
+                fim_dt = inicio_dt
+            grupos[self._incidente_overlap_key(item)].append(
+                {
+                    "raw": dict(item),
+                    "inicio": inicio_dt,
+                    "fim": fim_dt,
+                    "fim_real": _parse_iso_datetime(item.get("fim_ts")),
+                }
+            )
+
+        saida = []
+        for _, itens in grupos.items():
+            itens.sort(key=lambda x: (x["inicio"], x["fim"]))
+            acumulados = []
+            for item in itens:
+                merged = False
+                for acc in acumulados:
+                    if not self._intervalos_se_sobrepoem(acc["inicio"], acc["fim"], item["inicio"], item["fim"]):
+                        continue
+                    acc["inicio"] = min(acc["inicio"], item["inicio"])
+                    acc["fim"] = max(acc["fim"], item["fim"])
+                    if acc["fim_real"] is None and item["fim_real"] is not None:
+                        acc["fim_real"] = item["fim_real"]
+                    elif acc["fim_real"] is not None and item["fim_real"] is not None:
+                        acc["fim_real"] = max(acc["fim_real"], item["fim_real"])
+                    merged = True
+                    break
+                if not merged:
+                    acumulados.append(item)
+
+            for item in acumulados:
+                raw = dict(item["raw"])
+                raw["inicio_ts"] = item["inicio"].isoformat()
+                raw["fim_ts"] = item["fim_real"].isoformat() if item["fim_real"] else None
+                saida.append(raw)
+
+        return sorted(
+            saida,
+            key=lambda x: (
+                str(x.get("usina", "")),
+                str(x.get("natureza", "")),
+                _parse_iso_datetime(x.get("inicio_ts")) or datetime.min,
+            ),
+        )
 
     def _montar_relatorio_semanal(self, inicio_semana: datetime, fim_semana: datetime, historico, ativos_rele, ativos_inv):
         ocorrencias = []
@@ -1855,20 +1953,26 @@ class MonitorService:
                 return False
             inicio_semana, fim_semana, report_id = pendente
             incidentes_api = self._coletar_incidentes_semana_api(inicio_semana, fim_semana)
+            incidentes_state = self._coletar_incidentes_semana_state(inicio_semana, fim_semana)
+
             if incidentes_api is None:
-                historico = list(self.historico_incidentes)
-                ativos_rele = dict(self.incidentes_rele_ativos)
-                ativos_inv = dict(self.incidentes_inv_ativos)
+                incidentes_finais = self._mesclar_incidentes_relatorio(incidentes_state, fim_semana)
                 logger.warning(
-                    "Relatorio semanal usando fallback de state local (coleta direta da API indisponivel)."
+                    "Relatorio semanal usando apenas state local (coleta direta da API indisponivel)."
                 )
             else:
-                historico = incidentes_api
-                ativos_rele = {}
-                ativos_inv = {}
+                incidentes_finais = self._mesclar_incidentes_relatorio(
+                    list(incidentes_api) + list(incidentes_state), fim_semana
+                )
+                logger.info(
+                    "[RELATORIO] Incidentes semanais consolidados | API: %s | State: %s | Final: %s",
+                    len(incidentes_api),
+                    len(incidentes_state),
+                    len(incidentes_finais),
+                )
 
         resumo_rows, ocorrencias_rows, semana_txt = self._montar_relatorio_semanal(
-            inicio_semana, fim_semana, historico, ativos_rele, ativos_inv
+            inicio_semana, fim_semana, incidentes_finais, {}, {}
         )
         fim_legivel = (fim_semana - timedelta(days=1)).strftime("%Y%m%d")
         arquivo = REPORT_DIR / f"relatorio_semanal_{inicio_semana.strftime('%Y%m%d')}_{fim_legivel}.xlsx"
