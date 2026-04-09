@@ -64,6 +64,19 @@ HEARTBEAT_TIMES = [
 SOLAR_WINDOW_START = dtime(6, 0)
 SOLAR_WINDOW_END = dtime(17, 30)
 SOLAR_WINDOW_LABEL = f"{SOLAR_WINDOW_START.strftime('%H:%M')}-{SOLAR_WINDOW_END.strftime('%H:%M')}"
+IBIMIRIM_INVERTER_SOLAR_WINDOW_START = dtime(7, 30)
+IBIMIRIM_INVERTER_SOLAR_WINDOW_END = dtime(17, 0)
+IBIMIRIM_INVERTER_SOLAR_WINDOW_LABEL = (
+    f"{IBIMIRIM_INVERTER_SOLAR_WINDOW_START.strftime('%H:%M')}"
+    f"-{IBIMIRIM_INVERTER_SOLAR_WINDOW_END.strftime('%H:%M')}"
+)
+IBIMIRIM_INVERTER_PLANT_NAMES = {
+    "COMP.IBI.2500.LT01",
+    "COMP.IBI.2500.LT02",
+    "COMP.IBI.2500.LT03",
+    "COMP.IBI.2500.LT04",
+    "COMP.IBI.2500.LT05",
+}
 WEEKLY_REPORT_CHECK_INTERVAL = 300
 WEEKLY_REPORT_GENERATION_TIME = dtime(0, 5)
 # Usa uma semana extra para reconstruir estado na borda da semana sem aumentar
@@ -622,6 +635,23 @@ def _formatar_duracao(segundos: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def _formatar_janela_solar_label(janela_inicio: dtime, janela_fim: dtime) -> str:
+    return f"{janela_inicio.strftime('%H:%M')}-{janela_fim.strftime('%H:%M')}"
+
+
+def _is_ibimirim_usina(usina_nome: str) -> bool:
+    if not usina_nome:
+        return False
+    nome_normalizado = str(usina_nome).strip().upper()
+    return nome_normalizado in IBIMIRIM_INVERTER_PLANT_NAMES or "IBIMIRIM" in nome_normalizado
+
+
+def _obter_janela_solar_inversor(usina_nome: str = None):
+    if _is_ibimirim_usina(usina_nome):
+        return IBIMIRIM_INVERTER_SOLAR_WINDOW_START, IBIMIRIM_INVERTER_SOLAR_WINDOW_END
+    return SOLAR_WINDOW_START, SOLAR_WINDOW_END
+
+
 def _calcular_sobreposicao_segundos(inicio: datetime, fim: datetime, faixa_ini: datetime, faixa_fim: datetime) -> float:
     ini = max(inicio, faixa_ini)
     end = min(fim, faixa_fim)
@@ -630,15 +660,20 @@ def _calcular_sobreposicao_segundos(inicio: datetime, fim: datetime, faixa_ini: 
     return float((end - ini).total_seconds())
 
 
-def _calcular_sobreposicao_janela_solar(inicio: datetime, fim: datetime) -> float:
+def _calcular_sobreposicao_janela_solar(
+    inicio: datetime,
+    fim: datetime,
+    janela_inicio: dtime = SOLAR_WINDOW_START,
+    janela_fim: dtime = SOLAR_WINDOW_END,
+) -> float:
     if fim <= inicio:
         return 0.0
     total = 0.0
     dia = inicio.date()
     while dia <= fim.date():
-        janela_ini = datetime.combine(dia, SOLAR_WINDOW_START)
-        janela_fim = datetime.combine(dia, SOLAR_WINDOW_END)
-        total += _calcular_sobreposicao_segundos(inicio, fim, janela_ini, janela_fim)
+        faixa_ini = datetime.combine(dia, janela_inicio)
+        faixa_fim = datetime.combine(dia, janela_fim)
+        total += _calcular_sobreposicao_segundos(inicio, fim, faixa_ini, faixa_fim)
         dia += timedelta(days=1)
     return total
 
@@ -750,9 +785,17 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
 
 
 # Avalia leituras de inversores para identificar falha (Pac 0) e recuperacao (Pac > 0).
-def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datetime, fim: datetime, falhas_ativas_previas: dict):
-    JANELA_INICIO = SOLAR_WINDOW_START
-    JANELA_FIM = SOLAR_WINDOW_END
+def detectar_falhas_inversores(
+    api: PVOperationAPI,
+    plant_id: str,
+    inicio: datetime,
+    fim: datetime,
+    falhas_ativas_previas: dict,
+    janela_inicio: dtime = SOLAR_WINDOW_START,
+    janela_fim: dtime = SOLAR_WINDOW_END,
+):
+    JANELA_INICIO = janela_inicio
+    JANELA_FIM = janela_fim
 
     leituras_por_inv = {}
     tem_dados = False
@@ -1630,8 +1673,15 @@ class MonitorService:
     def _coletar_incidentes_inversor_semana_api(self, usina_id: str, usina_nome: str, inicio_semana: datetime, fim_semana: datetime):
         inicio_busca = inicio_semana - timedelta(days=WEEKLY_REPORT_WARMUP_DAYS)
         fim_busca = fim_semana - timedelta(seconds=1)
+        janela_inicio, janela_fim = _obter_janela_solar_inversor(usina_nome)
         falhas, recuperados, _, _, _ = detectar_falhas_inversores(
-            self.api_inversor, usina_id, inicio_busca, fim_busca, {}
+            self.api_inversor,
+            usina_id,
+            inicio_busca,
+            fim_busca,
+            {},
+            janela_inicio=janela_inicio,
+            janela_fim=janela_fim,
         )
         eventos = []
         for falha in falhas:
@@ -1838,7 +1888,16 @@ class MonitorService:
                 return
             clip_ini = max(inicio_dt, inicio_semana)
             clip_fim = min(fim_dt, fim_semana)
-            solar_sec = _calcular_sobreposicao_janela_solar(clip_ini, clip_fim)
+            janela_inicio = SOLAR_WINDOW_START
+            janela_fim = SOLAR_WINDOW_END
+            if str(base.get("natureza", "")).upper() == "INVERSOR":
+                janela_inicio, janela_fim = _obter_janela_solar_inversor(base.get("usina"))
+            solar_sec = _calcular_sobreposicao_janela_solar(
+                clip_ini,
+                clip_fim,
+                janela_inicio=janela_inicio,
+                janela_fim=janela_fim,
+            )
             key = (
                 str(base.get("chave", "")),
                 str(base.get("inicio_ts", "")),
@@ -2281,6 +2340,8 @@ class MonitorService:
 
                 nome = p.get("nome")
                 cap = p.get("capacidade")
+                janela_inicio_inv, janela_fim_inv = _obter_janela_solar_inversor(nome)
+                janela_label_inv = _formatar_janela_solar_label(janela_inicio_inv, janela_fim_inv)
 
                 last_usina = self.ultima_varredura_inversor_por_usina.get(usina_id)
                 if last_usina:
@@ -2289,7 +2350,13 @@ class MonitorService:
                     inicio_janela = inicio_padrao
 
                 falhas, recuperados, tem_dados_inv, falhas_ativas_atual, teve_timeout = detectar_falhas_inversores(
-                    self.api_inversor, usina_id, inicio_janela, agora, self.estado_inversores
+                    self.api_inversor,
+                    usina_id,
+                    inicio_janela,
+                    agora,
+                    self.estado_inversores,
+                    janela_inicio=janela_inicio_inv,
+                    janela_fim=janela_fim_inv,
                 )
                 if teve_timeout:
                     logger_inv.warning(
@@ -2319,6 +2386,7 @@ class MonitorService:
                             "ts_iso": item["ts_leitura"].isoformat(),
                             "status": item["status"],
                             "indicadores": item.get("indicadores", {}),
+                            "janela_solar_label": janela_label_inv,
                         }
                         enviado = self._notificar_inversor_recuperado(alerta, alerta_prev)
                         if enviado:
@@ -2350,6 +2418,7 @@ class MonitorService:
                             "ts_iso": item["ts_leitura"].isoformat(),
                             "status": item["status"],
                             "indicadores": item.get("indicadores", {}),
+                            "janela_solar_label": janela_label_inv,
                         }
                         entry["alerta"] = alerta
                         self._registrar_inicio_incidente_inversor(
@@ -2570,6 +2639,7 @@ class MonitorService:
     def _notificar_inversor(self, alerta):
         inds = alerta.get("indicadores", {})
         detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
+        janela_label = alerta.get("janela_solar_label", SOLAR_WINDOW_LABEL)
         msg = (
             f"Usina: {alerta['usina']}\n"
             f"Inversor: {alerta['inversor']}\n"
@@ -2580,7 +2650,7 @@ class MonitorService:
         logger_inv.warning(f"[ALERTA INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             return _teams_post_card(
-                title=f"⚠️ Falha de Inversor (Pac=0; 3 leituras; {SOLAR_WINDOW_LABEL})",
+                title=f"⚠️ Falha de Inversor (Pac=0; 3 leituras; {janela_label})",
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
                     f"**Inversor:** {alerta['inversor']}  \n"
@@ -2598,6 +2668,7 @@ class MonitorService:
     def _notificar_inversor_recuperado(self, alerta, alerta_prev=None):
         inds = alerta.get("indicadores", {})
         detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
+        janela_label = alerta.get("janela_solar_label", SOLAR_WINDOW_LABEL)
         msg = (
             f"Usina: {alerta['usina']}\n"
             f"Inversor: {alerta['inversor']}\n"
@@ -2608,7 +2679,7 @@ class MonitorService:
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             return _teams_post_card(
-                title=f"✔️ Normalização de Inversor (Pac=0; 3 leituras; {SOLAR_WINDOW_LABEL})",
+                title=f"✔️ Normalização de Inversor (Pac=0; 3 leituras; {janela_label})",
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
                     f"**Inversor:** {alerta['inversor']}  \n"
