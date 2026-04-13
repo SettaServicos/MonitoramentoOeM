@@ -103,6 +103,7 @@ MAX_PENDING_RELE_POR_USINA = 200
 MAX_PENDING_INV = 400
 MAX_INCIDENT_HISTORY = 10000
 INCIDENT_RETENTION_DAYS = 180
+INVERTER_MISSING_SCAN_TOLERANCE = 3
 
 # alias para compatibilidade interna
 BASE_URL = PVOP_BASE_URL
@@ -1200,6 +1201,51 @@ class MonitorService:
         finalizado["fim_ts"] = fim_dt.isoformat()
         self.historico_incidentes.append(finalizado)
 
+    def _reconciliar_inversores_ausentes(self, usina_id: str, chaves_observadas, referencia_ts: datetime):
+        if not usina_id:
+            return
+        observadas = {str(chave) for chave in (chaves_observadas or []) if chave}
+        for chave_inv, estado in list(self.estado_inversores.items()):
+            if not isinstance(estado, dict):
+                continue
+            if not chave_inv.startswith(f"{usina_id}:"):
+                continue
+            if chave_inv in observadas:
+                if int(estado.get("ausente_scans", 0)):
+                    estado["ausente_scans"] = 0
+                    self.estado_inversores[chave_inv] = estado
+                continue
+            if not estado.get("ativa"):
+                if int(estado.get("ausente_scans", 0)):
+                    estado["ausente_scans"] = 0
+                    self.estado_inversores[chave_inv] = estado
+                continue
+
+            ausente_scans = int(estado.get("ausente_scans", 0)) + 1
+            if ausente_scans < INVERTER_MISSING_SCAN_TOLERANCE:
+                estado["ausente_scans"] = ausente_scans
+                self.estado_inversores[chave_inv] = estado
+                continue
+
+            alerta_prev = estado.get("alerta")
+            logger_inv.warning(
+                f"Inversor {chave_inv} ausente em {ausente_scans} varreduras validas; limpando alerta ativo preso."
+            )
+            estado["ativa"] = False
+            estado["rec_seq"] = 0
+            estado["seq_zero"] = 0
+            estado["alerta"] = None
+            estado["notificado"] = False
+            estado["ausente_scans"] = 0
+            self.estado_inversores[chave_inv] = estado
+            self.pending_notifications.get("inv_normalizados", {}).pop(chave_inv, None)
+            self._registrar_fim_incidente_inversor(
+                chave_inv=chave_inv,
+                fim_ts=referencia_ts,
+                alerta_prev=alerta_prev,
+                usina_id=usina_id,
+            )
+
     # Carrega estado de ultima varredura e listas de alertas persistidos em disco.
     def _load_state(self):
         if not STATE_FILE.exists():
@@ -1357,6 +1403,7 @@ class MonitorService:
                         "seq_zero": int(estado.get("seq_zero", 0)),
                         "alerta": estado.get("alerta"),
                         "notificado": bool(estado.get("notificado", False)),
+                        "ausente_scans": int(estado.get("ausente_scans", 0)),
                     }
             else:
                 raw_falhas = data.get("falhas_ativas_por_inv", {})
@@ -1375,6 +1422,7 @@ class MonitorService:
                             "seq_zero": int(estado.get("seq_zero", 0)),
                             "alerta": None,
                             "notificado": _is_notificado(estado_key, raw_notificados),
+                            "ausente_scans": int(estado.get("ausente_scans", 0)),
                         }
                 if isinstance(raw_alertas, dict):
                     for chave, alerta in raw_alertas.items():
@@ -1385,6 +1433,7 @@ class MonitorService:
                         )
                         entry["alerta"] = alerta
                         entry["notificado"] = entry.get("notificado", False) or _is_notificado(estado_key, raw_notificados)
+                        entry["ausente_scans"] = int(entry.get("ausente_scans", 0))
                         self.estado_inversores[estado_key] = entry
 
             for base in list(self.rele_alertas_ativos):
@@ -2370,6 +2419,7 @@ class MonitorService:
                 for falha in falhas:
                     eventos.append(("falha", falha["ts_leitura"], falha))
                 eventos.sort(key=lambda item: item[1])
+                chaves_observadas = set(falhas_ativas_atual.keys())
 
                 tentativas_envio = set()
 
@@ -2434,6 +2484,13 @@ class MonitorService:
                             tentativas_envio.add(chave_inv)
                         self.estado_inversores[chave_inv] = entry
 
+                if chaves_observadas:
+                    self._reconciliar_inversores_ausentes(
+                        usina_id=usina_id,
+                        chaves_observadas=chaves_observadas,
+                        referencia_ts=agora,
+                    )
+
                 if not tem_dados_inv:
                     motivo = "TIMEOUT" if teve_timeout else "SEM_DADOS"
                     logger_inv.warning(f"Sem dados de inversor em {nome} (motivo: {motivo}).")
@@ -2466,6 +2523,7 @@ class MonitorService:
                         "seq_zero": int(estado.get("seq_zero", 0)),
                         "alerta": prev_entry.get("alerta"),
                         "notificado": bool(prev_entry.get("notificado", False)),
+                        "ausente_scans": 0,
                     }
                     if not entry["ativa"]:
                         entry["alerta"] = None
