@@ -64,6 +64,12 @@ HEARTBEAT_TIMES = [
 SOLAR_WINDOW_START = dtime(6, 0)
 SOLAR_WINDOW_END = dtime(17, 30)
 SOLAR_WINDOW_LABEL = f"{SOLAR_WINDOW_START.strftime('%H:%M')}-{SOLAR_WINDOW_END.strftime('%H:%M')}"
+INVERTER_SOLAR_WINDOW_START = dtime(6, 30)
+INVERTER_SOLAR_WINDOW_END = dtime(17, 0)
+INVERTER_SOLAR_WINDOW_LABEL = (
+    f"{INVERTER_SOLAR_WINDOW_START.strftime('%H:%M')}"
+    f"-{INVERTER_SOLAR_WINDOW_END.strftime('%H:%M')}"
+)
 IBIMIRIM_INVERTER_SOLAR_WINDOW_START = dtime(7, 30)
 IBIMIRIM_INVERTER_SOLAR_WINDOW_END = dtime(17, 0)
 IBIMIRIM_INVERTER_SOLAR_WINDOW_LABEL = (
@@ -103,7 +109,10 @@ MAX_PENDING_RELE_POR_USINA = 200
 MAX_PENDING_INV = 400
 MAX_INCIDENT_HISTORY = 10000
 INCIDENT_RETENTION_DAYS = 180
+INVERTER_CONSECUTIVE_READINGS = 5
+INVERTER_FAILURE_LABEL = f"PAC=0 ({INVERTER_CONSECUTIVE_READINGS} leituras consecutivas)"
 INVERTER_MISSING_SCAN_TOLERANCE = 3
+INVERTER_HEARTBEAT_CONFIRMATION_TTL = timedelta(seconds=(INVERTER_INTERVAL * 3) + 60)
 
 # alias para compatibilidade interna
 BASE_URL = PVOP_BASE_URL
@@ -650,7 +659,7 @@ def _is_ibimirim_usina(usina_nome: str) -> bool:
 def _obter_janela_solar_inversor(usina_nome: str = None):
     if _is_ibimirim_usina(usina_nome):
         return IBIMIRIM_INVERTER_SOLAR_WINDOW_START, IBIMIRIM_INVERTER_SOLAR_WINDOW_END
-    return SOLAR_WINDOW_START, SOLAR_WINDOW_END
+    return INVERTER_SOLAR_WINDOW_START, INVERTER_SOLAR_WINDOW_END
 
 
 def _calcular_sobreposicao_segundos(inicio: datetime, fim: datetime, faixa_ini: datetime, faixa_fim: datetime) -> float:
@@ -792,8 +801,8 @@ def detectar_falhas_inversores(
     inicio: datetime,
     fim: datetime,
     falhas_ativas_previas: dict,
-    janela_inicio: dtime = SOLAR_WINDOW_START,
-    janela_fim: dtime = SOLAR_WINDOW_END,
+    janela_inicio: dtime = INVERTER_SOLAR_WINDOW_START,
+    janela_fim: dtime = INVERTER_SOLAR_WINDOW_END,
 ):
     JANELA_INICIO = janela_inicio
     JANELA_FIM = janela_fim
@@ -888,6 +897,7 @@ def detectar_falhas_inversores(
         ativa = bool(prev_state.get("ativa", False))
         rec_seq = int(prev_state.get("rec_seq", 0))
         seq_zero = int(prev_state.get("seq_zero", 0))
+        ultima_confirmacao_dt = _parse_iso_datetime(prev_state.get("ultima_confirmacao_ts"))
         last_valid_ts = None
 
         for item in lst:
@@ -907,7 +917,7 @@ def detectar_falhas_inversores(
                 rec_seq = rec_seq + 1
             last_valid_ts = ts
 
-            if seq_zero >= 3 and not ativa:
+            if seq_zero >= INVERTER_CONSECUTIVE_READINGS and not ativa:
                 falhas.append(
                     {
                         "inversor_id": str(inv_id),
@@ -918,8 +928,12 @@ def detectar_falhas_inversores(
                 )
                 ativa = True
                 rec_seq = 0
+                ultima_confirmacao_dt = ts
 
-            if ativa and rec_seq >= 3:
+            if ativa and pac_zero:
+                ultima_confirmacao_dt = ts
+
+            if ativa and rec_seq >= INVERTER_CONSECUTIVE_READINGS:
                 recuperados.append(
                     {
                         "inversor_id": str(inv_id),
@@ -930,8 +944,14 @@ def detectar_falhas_inversores(
                 )
                 ativa = False
                 rec_seq = 0
+                ultima_confirmacao_dt = None
 
-        falhas_ativas[state_key] = {"ativa": ativa, "rec_seq": rec_seq, "seq_zero": seq_zero}
+        falhas_ativas[state_key] = {
+            "ativa": ativa,
+            "rec_seq": rec_seq,
+            "seq_zero": seq_zero,
+            "ultima_confirmacao_ts": ultima_confirmacao_dt.isoformat() if ultima_confirmacao_dt else None,
+        }
 
     def _intervalo_atinge_janela(inicio_dt: datetime, fim_dt: datetime) -> bool:
         if fim_dt < inicio_dt:
@@ -1170,7 +1190,7 @@ class MonitorService:
             self.incidentes_inv_ativos[chave_inv] = self._novo_incidente(
                 base_key=chave_inv,
                 natureza="INVERSOR",
-                tipo_falha="PAC=0 (3 leituras consecutivas)",
+                tipo_falha=INVERTER_FAILURE_LABEL,
                 usina_id=usina_id,
                 usina=usina,
                 equipamento=inversor_id,
@@ -1187,7 +1207,7 @@ class MonitorService:
             incidente = self._novo_incidente(
                 base_key=chave_inv,
                 natureza="INVERSOR",
-                tipo_falha="PAC=0 (3 leituras consecutivas)",
+                tipo_falha=INVERTER_FAILURE_LABEL,
                 usina_id=fallback_usina_id,
                 usina=alerta.get("usina"),
                 equipamento=alerta.get("inversor", fallback_inv),
@@ -1237,6 +1257,7 @@ class MonitorService:
             estado["alerta"] = None
             estado["notificado"] = False
             estado["ausente_scans"] = 0
+            estado["ultima_confirmacao_ts"] = None
             self.estado_inversores[chave_inv] = estado
             self.pending_notifications.get("inv_normalizados", {}).pop(chave_inv, None)
             self._registrar_fim_incidente_inversor(
@@ -1366,7 +1387,7 @@ class MonitorService:
                     self.incidentes_inv_ativos[str(chave)] = {
                         "chave": str(item.get("chave", chave)),
                         "natureza": str(item.get("natureza", "INVERSOR")),
-                        "tipo_falha": str(item.get("tipo_falha", "PAC=0 (3 leituras consecutivas)")),
+                        "tipo_falha": str(item.get("tipo_falha", INVERTER_FAILURE_LABEL)),
                         "usina_id": str(item.get("usina_id", "")),
                         "usina": item.get("usina"),
                         "equipamento": str(item.get("equipamento", "")),
@@ -1404,6 +1425,7 @@ class MonitorService:
                         "alerta": estado.get("alerta"),
                         "notificado": bool(estado.get("notificado", False)),
                         "ausente_scans": int(estado.get("ausente_scans", 0)),
+                        "ultima_confirmacao_ts": estado.get("ultima_confirmacao_ts"),
                     }
             else:
                 raw_falhas = data.get("falhas_ativas_por_inv", {})
@@ -1423,6 +1445,7 @@ class MonitorService:
                             "alerta": None,
                             "notificado": _is_notificado(estado_key, raw_notificados),
                             "ausente_scans": int(estado.get("ausente_scans", 0)),
+                            "ultima_confirmacao_ts": estado.get("ultima_confirmacao_ts"),
                         }
                 if isinstance(raw_alertas, dict):
                     for chave, alerta in raw_alertas.items():
@@ -1434,6 +1457,7 @@ class MonitorService:
                         entry["alerta"] = alerta
                         entry["notificado"] = entry.get("notificado", False) or _is_notificado(estado_key, raw_notificados)
                         entry["ausente_scans"] = int(entry.get("ausente_scans", 0))
+                        entry["ultima_confirmacao_ts"] = entry.get("ultima_confirmacao_ts")
                         self.estado_inversores[estado_key] = entry
 
             for base in list(self.rele_alertas_ativos):
@@ -1471,7 +1495,7 @@ class MonitorService:
                 self.incidentes_inv_ativos[chave_inv] = self._novo_incidente(
                     base_key=chave_inv,
                     natureza="INVERSOR",
-                    tipo_falha="PAC=0 (3 leituras consecutivas)",
+                    tipo_falha=INVERTER_FAILURE_LABEL,
                     usina_id=usina_id,
                     usina=alerta.get("usina"),
                     equipamento=alerta.get("inversor", inv_id),
@@ -1757,7 +1781,7 @@ class MonitorService:
                 {
                     "chave": chave,
                     "natureza": "INVERSOR",
-                    "tipo_falha": "PAC=0 (3 leituras consecutivas)",
+                    "tipo_falha": INVERTER_FAILURE_LABEL,
                     "usina_id": str(usina_id),
                     "usina": usina_nome or f"Usina {usina_id}",
                     "equipamento": inv_id,
@@ -1772,7 +1796,7 @@ class MonitorService:
                 {
                     "chave": chave,
                     "natureza": "INVERSOR",
-                    "tipo_falha": "PAC=0 (3 leituras consecutivas)",
+                    "tipo_falha": INVERTER_FAILURE_LABEL,
                     "usina_id": str(usina_id),
                     "usina": usina_nome or f"Usina {usina_id}",
                     "equipamento": inv_id,
@@ -2097,7 +2121,10 @@ class MonitorService:
                 return True
             self.last_weekly_report_id = report_id
             self._save_state()
-        logger.info(f"Relatorio semanal gerado: {arquivo} | Janela solar: {SOLAR_WINDOW_LABEL} | Semana: {semana_txt}")
+        logger.info(
+            f"Relatorio semanal gerado: {arquivo} | Janela solar rele: {SOLAR_WINDOW_LABEL} | "
+            f"Janela solar inversor: {INVERTER_SOLAR_WINDOW_LABEL} | Semana: {semana_txt}"
+        )
         return True
 
     # Busca alertas de rele nas usinas e dispara notificacoes unicas por evento.
@@ -2524,10 +2551,12 @@ class MonitorService:
                         "alerta": prev_entry.get("alerta"),
                         "notificado": bool(prev_entry.get("notificado", False)),
                         "ausente_scans": 0,
+                        "ultima_confirmacao_ts": estado.get("ultima_confirmacao_ts") or prev_entry.get("ultima_confirmacao_ts"),
                     }
                     if not entry["ativa"]:
                         entry["alerta"] = None
                         entry["notificado"] = False
+                        entry["ultima_confirmacao_ts"] = None
                     self.estado_inversores[chave_inv] = entry
 
                 if tem_dados_inv:
@@ -2550,6 +2579,17 @@ class MonitorService:
         return f"Primeiro alerta às {ts_first.strftime('%H:%M')} e último às {ts_last.strftime('%H:%M')}"
 
     @staticmethod
+    def _inversor_conta_no_heartbeat(estado, referencia: datetime) -> bool:
+        if not isinstance(estado, dict):
+            return False
+        if not estado.get("ativa"):
+            return False
+        ultima_confirmacao = _parse_iso_datetime(estado.get("ultima_confirmacao_ts"))
+        if not ultima_confirmacao or not isinstance(referencia, datetime):
+            return False
+        return (referencia - ultima_confirmacao) <= INVERTER_HEARTBEAT_CONFIRMATION_TTL
+
+    @staticmethod
     def _proximo_horario_heartbeat(ref: datetime) -> datetime:
         # encontra o próximo horário programado a partir de ref
         hoje = ref.date()
@@ -2563,12 +2603,15 @@ class MonitorService:
 
     # Envia notificacao de heartbeat/saude em horarios fixos.
     def _enviar_heartbeat(self, previsto: datetime):
+        referencia_hb = previsto if isinstance(previsto, datetime) else datetime.now()
         with self._scan_lock:
             rele_alertas = list(self.rele_alertas_ativos)
             rele_alerta_chave = dict(self.rele_alerta_chave)
             estado_inversores = dict(self.estado_inversores)
             ativos_rele = len(rele_alertas)
-            ativos_inv = sum(1 for estado in estado_inversores.values() if estado.get("ativa"))
+            ativos_inv = sum(
+                1 for estado in estado_inversores.values() if self._inversor_conta_no_heartbeat(estado, referencia_hb)
+            )
             ultima_rele = self.ultima_varredura_rele
             ultima_inv = self.ultima_varredura_inversor
 
@@ -2586,7 +2629,7 @@ class MonitorService:
         inv_usina_counts = {}
         if ativos_inv:
             for chave, estado in estado_inversores.items():
-                if not estado.get("ativa"):
+                if not self._inversor_conta_no_heartbeat(estado, referencia_hb):
                     continue
                 alerta = estado.get("alerta") or {}
                 nome = alerta.get("usina")
@@ -2697,7 +2740,8 @@ class MonitorService:
     def _notificar_inversor(self, alerta):
         inds = alerta.get("indicadores", {})
         detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
-        janela_label = alerta.get("janela_solar_label", SOLAR_WINDOW_LABEL)
+        janela_inicio, janela_fim = _obter_janela_solar_inversor(alerta.get("usina"))
+        janela_label = alerta.get("janela_solar_label", _formatar_janela_solar_label(janela_inicio, janela_fim))
         msg = (
             f"Usina: {alerta['usina']}\n"
             f"Inversor: {alerta['inversor']}\n"
@@ -2708,7 +2752,7 @@ class MonitorService:
         logger_inv.warning(f"[ALERTA INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             return _teams_post_card(
-                title=f"⚠️ Falha de Inversor (Pac=0; 3 leituras; {janela_label})",
+                title=f"⚠️ Falha de Inversor (Pac=0; {INVERTER_CONSECUTIVE_READINGS} leituras; {janela_label})",
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
                     f"**Inversor:** {alerta['inversor']}  \n"
@@ -2726,7 +2770,8 @@ class MonitorService:
     def _notificar_inversor_recuperado(self, alerta, alerta_prev=None):
         inds = alerta.get("indicadores", {})
         detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
-        janela_label = alerta.get("janela_solar_label", SOLAR_WINDOW_LABEL)
+        janela_inicio, janela_fim = _obter_janela_solar_inversor(alerta.get("usina"))
+        janela_label = alerta.get("janela_solar_label", _formatar_janela_solar_label(janela_inicio, janela_fim))
         msg = (
             f"Usina: {alerta['usina']}\n"
             f"Inversor: {alerta['inversor']}\n"
@@ -2737,7 +2782,7 @@ class MonitorService:
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             return _teams_post_card(
-                title=f"✔️ Normalização de Inversor (Pac=0; 3 leituras; {janela_label})",
+                title=f"✔️ Normalização de Inversor (Pac=0; {INVERTER_CONSECUTIVE_READINGS} leituras; {janela_label})",
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
                     f"**Inversor:** {alerta['inversor']}  \n"
