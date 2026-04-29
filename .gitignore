@@ -30,7 +30,9 @@ monitor_state*.json*
 state/
 artifacts/
 
-# Cleanup staging (generated only)
-deletar/generated/
-
+# Relatórios gerados (Excel)
 reports/*
+*.xlsx
+cod2/*
+legacy/*
+deletar/*
