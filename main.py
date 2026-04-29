@@ -397,7 +397,7 @@ def detectar_falhas_inversores(
 
             pac = extrair_valor_numerico(pac_raw)
 
-            if not pac_raw or not pac:
+            if pac_raw is None or pac is None:
                 entry = {"ts": ts, "cond_ok": False, "sem_dados": True, "pac": None}
                 leituras_por_inv.setdefault(inv_id, []).append(entry)
                 continue
@@ -526,6 +526,7 @@ class MonitorService:
         self.incidentes_rele_ativos = {}      # base rele -> incidente aberto
         self.incidentes_inv_ativos = {}       # usina:inv -> incidente aberto
         self.historico_incidentes = []        # incidentes concluídos (relé e inversor)
+        self.last_weekly_report_id = None
 
     # Prepara estado inicial do servico e caches de alertas.
     def __init__(self, api_rele: PVOperation, api_inversor: PVOperation = None):
@@ -762,7 +763,7 @@ class MonitorService:
         finalizado["fim_ts"] = fim_dt.isoformat()
         self.historico_incidentes.append(finalizado)
 
-    def _reconciliar_inversores_ausentes(self, usina_id: str, chaves_observadas, referencia_ts: datetime):
+    def _reconciliar_inversores_ausentes(self, usina_id: str, chaves_observadas):
         if not usina_id:
             return
         observadas = {str(chave) for chave in (chaves_observadas or []) if chave}
@@ -788,25 +789,12 @@ class MonitorService:
                 self.estado_inversores[chave_inv] = estado
                 continue
 
-            alerta_prev = estado.get("alerta")
             logger_inv.warning(
-                f"Inversor {chave_inv} ausente em {ausente_scans} varreduras validas; limpando alerta ativo preso."
+                f"Inversor {chave_inv} ausente em {ausente_scans} varreduras validas; suprimindo do heartbeat."
             )
-            estado["ativa"] = False
-            estado["rec_seq"] = 0
-            estado["seq_zero"] = 0
-            estado["alerta"] = None
-            estado["notificado"] = False
-            estado["ausente_scans"] = 0
+            estado["ausente_scans"] = INVERTER_MISSING_SCAN_TOLERANCE
             estado["ultima_confirmacao_ts"] = None
             self.estado_inversores[chave_inv] = estado
-            self.pending_notifications.get("inv_normalizados", {}).pop(chave_inv, None)
-            self._registrar_fim_incidente_inversor(
-                chave_inv=chave_inv,
-                fim_ts=referencia_ts,
-                alerta_prev=alerta_prev,
-                usina_id=usina_id,
-            )
 
     # Carrega estado de ultima varredura e listas de alertas persistidos em disco.
     def _load_state(self):
@@ -855,6 +843,7 @@ class MonitorService:
                         self.ultima_varredura_inversor_por_usina[str(usina_id)] = datetime.fromisoformat(ts)
                     except Exception:
                         continue
+            self.last_weekly_report_id = data.get("last_weekly_report_id")
             self.rele_alertas_ativos = set(data.get("rele_alertas_ativos", []))
             self.rele_notificados = set(data.get("rele_notificados", []))
             self.rele_alerta_chave = data.get("rele_alerta_chave", {})
@@ -997,6 +986,17 @@ class MonitorService:
                         entry["ultima_confirmacao_ts"] = entry.get("ultima_confirmacao_ts")
                         self.estado_inversores[estado_key] = entry
 
+            for chave_inv, estado in self.estado_inversores.items():
+                if not isinstance(estado, dict) or not estado.get("ativa"):
+                    continue
+                if estado.get("ultima_confirmacao_ts"):
+                    continue
+                usina_id_inv = chave_inv.split(":", 1)[0] if ":" in chave_inv else None
+                if usina_id_inv:
+                    dt = self.ultima_varredura_inversor_por_usina.get(usina_id_inv)
+                    estado["ultima_confirmacao_ts"] = dt.isoformat() if dt else None
+                    self.estado_inversores[chave_inv] = estado
+
             for base in list(self.rele_alertas_ativos):
                 if base in self.incidentes_rele_ativos:
                     continue
@@ -1073,6 +1073,7 @@ class MonitorService:
                 "incidentes_rele_ativos": self.incidentes_rele_ativos,
                 "incidentes_inv_ativos": self.incidentes_inv_ativos,
                 "historico_incidentes": self.historico_incidentes,
+                "last_weekly_report_id": self.last_weekly_report_id,
             }
             tmp_path = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
             with self._state_lock:
@@ -1537,10 +1538,15 @@ class MonitorService:
 
         return resumo_rows, ocorrencias_rows, semana_txt
 
-    def gerar_relatorio_semanal(self, ref: datetime = None) -> None:
+    def _gerar_relatorio_semanal_se_pendente(self, ref: datetime = None) -> bool:
         agora = ref or datetime.now()
         fim_semana = inicio_semana(agora)
         inicio_semana_relatorio = fim_semana - timedelta(days=7)
+        week_id = inicio_semana_relatorio.strftime("%Y-%m-%d")
+
+        if self.last_weekly_report_id == week_id:
+            return False
+
         with self._scan_lock:
             incidentes_api = self._coletar_incidentes_semana_api(inicio_semana_relatorio, fim_semana)
             incidentes_state = self._coletar_incidentes_semana_state(inicio_semana_relatorio, fim_semana)
@@ -1568,12 +1574,30 @@ class MonitorService:
         fim_legivel = (fim_semana - timedelta(days=1)).strftime("%Y%m%d")
         file_path = REPORT_DIR / f"relatorio_semanal_{inicio_semana_relatorio.strftime('%Y%m%d')}_{fim_legivel}.xlsx"
         write_xlsx_file(file_path, [("Resumo", resumo_rows), ("Ocorrencias", ocorrencias_rows)])
-        OutlookMailService().send_weekly_report(file_path, semana_txt)
 
+        self.last_weekly_report_id = week_id
         logger.info(
             f"Relatorio semanal gerado: {file_path} | Janela solar rele: {SOLAR_WINDOW_LABEL} | "
             f"Janela solar inversor: {INVERTER_SOLAR_WINDOW_LABEL} | Semana: {semana_txt}"
         )
+        return True
+
+    def gerar_relatorio_semanal(self, ref: datetime = None) -> None:
+        agora = ref or datetime.now()
+        fim_semana = inicio_semana(agora)
+        inicio_semana_relatorio = fim_semana - timedelta(days=7)
+        fim_legivel = (fim_semana - timedelta(days=1)).strftime("%Y%m%d")
+        file_path = REPORT_DIR / f"relatorio_semanal_{inicio_semana_relatorio.strftime('%Y%m%d')}_{fim_legivel}.xlsx"
+        semana_txt = (
+            f"{inicio_semana_relatorio.strftime('%d/%m/%Y')} a "
+            f"{(fim_semana - timedelta(seconds=1)).strftime('%d/%m/%Y')}"
+        )
+
+        if not self._gerar_relatorio_semanal_se_pendente(ref=agora):
+            logger.info("Relatorio semanal ja gerado para esta semana.")
+            return
+
+        OutlookMailService().send_weekly_report(file_path, semana_txt)
 
     # Busca alertas de rele nas usinas e dispara notificacoes unicas por evento.
     def executar_varredura_rele(self):
@@ -1953,7 +1977,6 @@ class MonitorService:
                     self._reconciliar_inversores_ausentes(
                         usina_id=usina_id,
                         chaves_observadas=chaves_observadas,
-                        referencia_ts=agora,
                     )
 
                 if not tem_dados_inv:
