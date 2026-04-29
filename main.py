@@ -60,7 +60,7 @@ INVERTER_INTERVAL = 900       # 15 min
 STOP_JOIN_TIMEOUT = 35        # aguarda encerramento das threads antes de forcar saida
 HEARTBEAT_TIMES = [
     time(7, 0),
-    time(12, 0),
+    time(12, 30),
     time(17, 0),
     time(20, 0),
     time(23, 0)
