@@ -32,3 +32,5 @@ artifacts/
 
 # Cleanup staging (generated only)
 deletar/generated/
+
+reports/*

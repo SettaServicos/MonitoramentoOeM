@@ -7,35 +7,39 @@
 #   de CA válido (ex.: .pem fornecido pela infra) ou ajuste VERIFY_CA.
 # ===========================================
 
-# Imports principais: bibliotecas nativas e de terceiros usadas em toda a aplicacao.
-import os
-import json
-import time
+
 import logging
-from logging.handlers import TimedRotatingFileHandler
-import threading
-from datetime import datetime, timedelta, time as dtime
-from email.utils import parsedate_to_datetime
-from pathlib import Path
-from requests import Session
-from requests.exceptions import Timeout
-import requests
-import re
-import atexit
+import os
 import sys
-import socket
-import signal
-from statistics import median
+import threading
+from atexit import register
 from collections import defaultdict
-from zipfile import ZipFile, ZIP_DEFLATED
+from datetime import datetime, time, timedelta
+from json import JSONDecodeError, dumps, loads
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
+from signal import SIGINT, SIGTERM, signal
+from socket import gethostname
+from statistics import median
+from time import sleep
+from typing import Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+
+from repositories import MSTeams, OutlookMailService, PVOperation, write_xlsx_file
+from utils import (calcular_sobreposicao_segundos, extrair_valor_numerico,
+                   fmt_ts, formatar_duracao, formatar_intervalo_alerta, formatar_janela_solar_label,
+                   inicio_semana, intervalos_se_sobrepoem, is_placeholder,
+                   parse_iso_datetime, valor_rele_ativo_relatorio)
 
 # =========================
 # CONFIGURACAO (EDITAR AQUI)
 # =========================
-PVOP_BASE_URL = "https://apipv.pvoperation.com.br/api/v1"
-PVOP_EMAIL = "monitoramento@settaenergia.com.br"
-PVOP_PASSWORD = "$$Setta1324"
-TEAMS_WEBHOOK_URL = "https://settaenergiarecife.webhook.office.com/webhookb2/ff6efec5-9ceb-4932-89ba-d4d8082a1975@77b21bc1-b0b7-4df6-9225-2e24fc9de0f6/IncomingWebhook/38f7efca2b124a17abc7dcc8a5a40c95/a29266d7-870f-4855-96b0-c21a4710f37b/V2rB2XbXOgznVTxAoIWIeDPnlRZ203j0jsNsLKr4cNK141"
+load_dotenv()
+PVOP_BASE_URL = os.environ.get("PVOP_BASE_URL")
+PVOP_EMAIL = os.environ.get("PVOP_EMAIL")
+PVOP_PASSWORD = os.environ.get("PVOP_PASSWORD")
+TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL")
 TEAMS_ENABLED = True
 # =========================
 
@@ -55,23 +59,23 @@ RELAY_INTERVAL = 600          # 10 min
 INVERTER_INTERVAL = 900       # 15 min
 STOP_JOIN_TIMEOUT = 35        # aguarda encerramento das threads antes de forcar saida
 HEARTBEAT_TIMES = [
-    dtime(7, 0),
-    dtime(12, 0),
-    dtime(17, 0),
-    dtime(20, 0),
-    dtime(23, 0)
+    time(7, 0),
+    time(12, 0),
+    time(17, 0),
+    time(20, 0),
+    time(23, 0)
 ]
-SOLAR_WINDOW_START = dtime(6, 0)
-SOLAR_WINDOW_END = dtime(17, 30)
+SOLAR_WINDOW_START = time(6, 0)
+SOLAR_WINDOW_END = time(17, 30)
 SOLAR_WINDOW_LABEL = f"{SOLAR_WINDOW_START.strftime('%H:%M')}-{SOLAR_WINDOW_END.strftime('%H:%M')}"
-INVERTER_SOLAR_WINDOW_START = dtime(6, 30)
-INVERTER_SOLAR_WINDOW_END = dtime(17, 0)
+INVERTER_SOLAR_WINDOW_START = time(6, 30)
+INVERTER_SOLAR_WINDOW_END = time(17, 0)
 INVERTER_SOLAR_WINDOW_LABEL = (
     f"{INVERTER_SOLAR_WINDOW_START.strftime('%H:%M')}"
     f"-{INVERTER_SOLAR_WINDOW_END.strftime('%H:%M')}"
 )
-IBIMIRIM_INVERTER_SOLAR_WINDOW_START = dtime(7, 30)
-IBIMIRIM_INVERTER_SOLAR_WINDOW_END = dtime(17, 0)
+IBIMIRIM_INVERTER_SOLAR_WINDOW_START = time(7, 30)
+IBIMIRIM_INVERTER_SOLAR_WINDOW_END = time(17, 0)
 IBIMIRIM_INVERTER_SOLAR_WINDOW_LABEL = (
     f"{IBIMIRIM_INVERTER_SOLAR_WINDOW_START.strftime('%H:%M')}"
     f"-{IBIMIRIM_INVERTER_SOLAR_WINDOW_END.strftime('%H:%M')}"
@@ -83,8 +87,6 @@ IBIMIRIM_INVERTER_PLANT_NAMES = {
     "COMP.IBI.2500.LT04",
     "COMP.IBI.2500.LT05",
 }
-WEEKLY_REPORT_CHECK_INTERVAL = 300
-WEEKLY_REPORT_GENERATION_TIME = dtime(0, 5)
 # Usa uma semana extra para reconstruir estado na borda da semana sem aumentar
 # demais a carga da API; o state local continua como segunda fonte.
 WEEKLY_REPORT_WARMUP_DAYS = 7
@@ -97,11 +99,11 @@ RELAY_PARAMS_CLASSIF = {
     "BLOQUEIO": {"rAR", "rBA", "rDO"},
 }
 RELAY_PARAMETROS = {
-    "r27A","r27B","r27C","r27_0","r32A","r32A_2","r32B","r32B_2","r32C","r32C_2",
-    "r46Q","r47","r59A","r59B","r59C","r59N","r67A","r67A_2","r67B","r67B_2",
-    "r67C","r67C_2","r67N_1","r67N_2","r78","r81O","r81U","r86","rAR","rBA",
-    "rDO","rEPwd","rERLS","rEl2t","rFR","rGS","rHLT","rRL1","rRL2","rRL3",
-    "rRL4","rRL5","rRR","r49","r49_2"
+    "r27A", "r27B", "r27C", "r27_0", "r32A", "r32A_2", "r32B", "r32B_2", "r32C", "r32C_2",
+    "r46Q", "r47", "r59A", "r59B", "r59C", "r59N", "r67A", "r67A_2", "r67B", "r67B_2",
+    "r67C", "r67C_2", "r67N_1", "r67N_2", "r78", "r81O", "r81U", "r86", "rAR", "rBA",
+    "rDO", "rEPwd", "rERLS", "rEl2t", "rFR", "rGS", "rHLT", "rRL1", "rRL2", "rRL3",
+    "rRL4", "rRL5", "rRR", "r49", "r49_2"
 }
 
 # Limites para evitar crescimento indefinido do state.
@@ -181,20 +183,16 @@ setup_logging()
 logger = logging.getLogger("RelayMonitorHeadless")
 logger_rele = logging.getLogger("RelayMonitorHeadless.rele")
 logger_inv = logging.getLogger("RelayMonitorHeadless.inversor")
+ms_teams = MSTeams(webhook_url=TEAMS_WEBHOOK_URL, enabled=TEAMS_ENABLED, logger=logger)
 
-def _is_placeholder(value: str) -> bool:
-    if value is None:
-        return True
-    raw = str(value).strip()
-    return (not raw) or (raw.upper() == "COLE_AQUI")
 
 def validate_config():
     missing = []
-    if _is_placeholder(PVOP_BASE_URL):
+    if is_placeholder(PVOP_BASE_URL):
         missing.append("PVOP_BASE_URL")
-    if _is_placeholder(PVOP_EMAIL):
+    if is_placeholder(PVOP_EMAIL):
         missing.append("PVOP_EMAIL")
-    if _is_placeholder(PVOP_PASSWORD):
+    if is_placeholder(PVOP_PASSWORD):
         missing.append("PVOP_PASSWORD")
     if missing:
         raise SystemExit(
@@ -202,451 +200,11 @@ def validate_config():
             + ", ".join(missing)
             + ". Edite a secao CONFIGURACAO no topo do main.py."
         )
-    if TEAMS_ENABLED and _is_placeholder(TEAMS_WEBHOOK_URL):
+    if ms_teams.is_enabled and is_placeholder(ms_teams.webhook_url):
         raise SystemExit(
             "TEAMS_ENABLED=True, mas TEAMS_WEBHOOK_URL esta ausente ou placeholder. "
             "Edite a secao CONFIGURACAO no topo do main.py."
         )
-
-# Envia cartao padrao (MessageCard) para Teams quando alertas ocorrem.
-def _teams_post_card(title, text, severity="info", facts=None):
-    """Envia um 'MessageCard' para um Incoming Webhook do Microsoft Teams."""
-    if not TEAMS_ENABLED:
-        return False
-    def _retry_after_seconds(resp):
-        retry_after = resp.headers.get("Retry-After")
-        if not retry_after:
-            return None
-        try:
-            return max(0, int(retry_after))
-        except (TypeError, ValueError):
-            pass
-        try:
-            parsed = parsedate_to_datetime(retry_after)
-        except Exception:
-            return None
-        if not parsed:
-            return None
-        now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
-        delta = (parsed - now).total_seconds()
-        return max(0, int(delta))
-
-    colors = {"info": "0078D4", "warning": "FFA000", "danger": "D13438"}
-    payload = {
-        "@type": "MessageCard",
-        "@context": "https://schema.org/extensions",
-        "summary": title,
-        "themeColor": colors.get(severity, "0078D4"),
-        "title": title,
-        "text": text,
-    }
-    if facts:
-        payload["sections"] = [{"facts": [{"name": k, "value": v} for k, v in facts]}]
-    max_tentativas = 3
-    backoff_base = 2
-    for tentativa in range(1, max_tentativas + 1):
-        try:
-            r = requests.post(
-                TEAMS_WEBHOOK_URL,
-                data=json.dumps(payload),
-                headers={"Content-Type": "application/json"},
-                timeout=10,
-            )
-            if r.status_code == 429:
-                espera = _retry_after_seconds(r)
-                if espera is not None:
-                    espera = min(max(0, espera), 60)
-                    if tentativa == max_tentativas:
-                        logger.warning("[TEAMS] Rate limit (429) excedeu tentativas.")
-                        return False
-                    time.sleep(espera)
-                    continue
-            r.raise_for_status()
-            return True
-        except Exception as e:
-            if tentativa == max_tentativas:
-                logger.warning(f"[TEAMS] Falha ao enviar webhook: {e}")
-                return False
-            time.sleep(backoff_base * tentativa)
-    return False
-
-
-# Cliente responsavel por autenticar na API PVOperation e expor chamadas encapsuladas.
-class PVOperationAPI:
-    """Cliente da API PVOperation com retry e verificação SSL configurável."""
-
-    # Inicializa credenciais, sessao HTTP e dispara autenticacao inicial.
-    def __init__(self, email, password, base_url=BASE_URL, verify=VERIFY_CA):
-        self.email = email
-        self.password = password
-        self.base_url = base_url
-        self._verify = verify  # guarda configuracao de verificacao SSL
-        self.session = Session()
-        self.session.verify = self._verify
-        self.token = None
-        self.headers = {}
-        self.last_get_plants_timeout = False
-        self.last_get_plants_error = False
-        self._login()
-
-    def _reset_session(self):
-        try:
-            self.session.close()
-        except Exception:
-            pass
-        self.session = Session()
-        self.session.verify = self._verify
-
-    def _retry_after_seconds(self, response):
-        retry_after = response.headers.get("Retry-After")
-        if not retry_after:
-            return None
-        try:
-            return max(0, int(retry_after))
-        except (TypeError, ValueError):
-            pass
-        try:
-            parsed = parsedate_to_datetime(retry_after)
-        except Exception:
-            return None
-        if not parsed:
-            return None
-        now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
-        delta = (parsed - now).total_seconds()
-        return max(0, int(delta))
-
-    def _request_with_retry(
-        self,
-        method: str,
-        url: str,
-        *,
-        headers=None,
-        json_payload=None,
-        timeout: int = 20,
-        max_tentativas: int = 3,
-        backoff_base: int = 2,
-        contexto: str = "",
-        reauth_on_401: bool = False,
-        retry_on_status=None,
-        log_status: bool = True,
-        conn_error_suffix: str = "Tentando recriar sessão.",
-    ):
-        def _should_retry(status_code: int) -> bool:
-            if retry_on_status is None:
-                return status_code == 429 or 500 <= status_code <= 599
-            if callable(retry_on_status):
-                return retry_on_status(status_code)
-            return status_code in retry_on_status
-
-        for tentativa in range(1, max_tentativas + 1):
-            try:
-                req_headers = headers if headers is not None else self.headers
-                resp = self.session.request(
-                    method,
-                    url,
-                    headers=req_headers,
-                    json=json_payload,
-                    timeout=timeout,
-                )
-            except Timeout:
-                logger.warning(
-                    f"Timeout em {contexto} - tentativa {tentativa}/{max_tentativas}."
-                )
-                if tentativa == max_tentativas:
-                    return None, True
-                time.sleep(backoff_base * tentativa)
-                continue
-            except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
-                logger.warning(
-                    f"Erro de conexão em {contexto}: {e}. {conn_error_suffix}"
-                )
-                self._reset_session()
-                if not self._login():
-                    if tentativa == max_tentativas:
-                        return None, False
-                    time.sleep(backoff_base * tentativa)
-                    continue
-                if tentativa == max_tentativas:
-                    return None, False
-                time.sleep(backoff_base * tentativa)
-                continue
-            except Exception as e:
-                logger.error(f"Erro em {contexto}: {e}")
-                return None, False
-
-            if resp.status_code == 401 and reauth_on_401:
-                if not self.verificar_token():
-                    return None, False
-                time.sleep(1)
-                continue
-
-            if _should_retry(resp.status_code):
-                if log_status:
-                    logger.warning(
-                        f"Status {resp.status_code} em {contexto} - tentativa {tentativa}/{max_tentativas}."
-                    )
-                if tentativa == max_tentativas:
-                    return resp, False
-                if resp.status_code == 429:
-                    espera = self._retry_after_seconds(resp)
-                    if espera is None:
-                        espera = min(backoff_base ** tentativa, 10)
-                else:
-                    espera = backoff_base * tentativa
-                time.sleep(espera)
-                continue
-
-            return resp, False
-
-        return None, False
-
-    # Executa login na API para obter token JWT e cabecalhos de autorizacao.
-    def _login(self) -> bool:
-        try:
-            resp = self.session.post(
-                f"{self.base_url}/authenticate",
-                json={"username": self.email, "password": self.password},
-                timeout=20,
-            )
-            if resp.status_code == 200:
-                try:
-                    token = resp.json().get("token")
-                except Exception as e:
-                    logger.error(f"Falha ao ler token da resposta: {e}")
-                    return False
-                if not token:
-                    logger.error("Falha na autenticação: token ausente na resposta.")
-                    return False
-                self.token = token
-                self.headers = {"x-access-token": self.token}
-                logger.info("Autenticação realizada com sucesso.")
-                return True
-            logger.error(f"Falha na autenticação. Status: {resp.status_code}")
-            return False
-        except Exception as e:
-            logger.error(f"Erro durante login: {e}")
-            return False
-
-    # Tenta renovar token quando as chamadas retornam nao autorizado.
-    def verificar_token(self) -> bool:
-        logger.warning("Tentando renovar token...")
-        ok = self._login()
-        if not ok:
-            logger.error("Não foi possível renovar o token.")
-        return ok
-
-    # Recupera lista de plantas tratando expiracao de sessao e reconexao.
-    def get_plants(self):
-        url = f"{self.base_url}/plants"
-        self.last_get_plants_timeout = False
-        self.last_get_plants_error = False
-        r, timeout_flag = self._request_with_retry(
-            "get",
-            url,
-            timeout=20,
-            max_tentativas=3,
-            backoff_base=2,
-            contexto="get_plants",
-            reauth_on_401=True,
-            retry_on_status=None,
-            log_status=False,
-            conn_error_suffix="Tentando recriar sessão e reautenticar.",
-        )
-        if r is None:
-            self.last_get_plants_timeout = bool(timeout_flag)
-            self.last_get_plants_error = True
-            return None
-        if r.status_code == 200:
-            return r.json() or []
-        logger.error(f"Erro ao buscar plantas. Status: {r.status_code}")
-        self.last_get_plants_error = True
-        return None
-
-    # Faz chamada para endpoint diario (day_*) com retry e backoff exponencial leve.
-    def post_day(self, endpoint: str, plant_id: int, date: datetime):
-        """Chama endpoints day_* com retry/backoff. Retorna (dados ou None, timeout_flag)."""
-        payload = {"id": int(plant_id), "date": date.strftime("%Y-%m-%d")}
-        url = f"{self.base_url}/{endpoint}"
-        contexto = f"{endpoint} (usina {plant_id}, {date.date()})"
-        r, timeout_flag = self._request_with_retry(
-            "post",
-            url,
-            json_payload=payload,
-            timeout=30,
-            max_tentativas=3,
-            backoff_base=2,
-            contexto=contexto,
-            reauth_on_401=True,
-            retry_on_status=lambda status: status == 408 or status == 429 or 500 <= status <= 599,
-            log_status=True,
-            conn_error_suffix="Tentando recriar sessão.",
-        )
-        if r is None:
-            return None, timeout_flag
-        if r.status_code == 200:
-            return r.json(), False
-        return None, False
-
-
-# Normaliza valores numericos vindos como string ou numero bruto para float.
-def extrair_valor_numerico(valor):
-    if isinstance(valor, bool):
-        return float(valor)
-    if isinstance(valor, (int, float)):
-        return float(valor)
-    if isinstance(valor, str):
-        txt = valor.strip()
-        if "," in txt and "." in txt and txt.rfind(",") > txt.rfind("."):
-            txt = txt.replace(".", "").replace(",", ".")
-        elif "," in txt and "." not in txt:
-            txt = txt.replace(",", ".")
-        m = re.search(r"([-+]?\d*\.\d+|\d+)", txt)
-        if m:
-            try:
-                return float(m.group(1))
-            except Exception:
-                return None
-    return None
-
-
-def _xml_escape(txt: str) -> str:
-    return (
-        txt.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
-def _xlsx_col_name(index_zero_based: int) -> str:
-    idx = int(index_zero_based)
-    if idx < 0:
-        raise ValueError("index de coluna invalido")
-    letters = []
-    while True:
-        idx, rem = divmod(idx, 26)
-        letters.append(chr(ord("A") + rem))
-        if idx == 0:
-            break
-        idx -= 1
-    return "".join(reversed(letters))
-
-
-def _build_sheet_xml(rows):
-    row_parts = []
-    for row_idx, row in enumerate(rows, start=1):
-        cell_parts = []
-        for col_idx, value in enumerate(row):
-            cell_ref = f"{_xlsx_col_name(col_idx)}{row_idx}"
-            if isinstance(value, bool):
-                val = "1" if value else "0"
-                cell_parts.append(f'<c r="{cell_ref}" t="b"><v>{val}</v></c>')
-                continue
-            if isinstance(value, (int, float)):
-                cell_parts.append(f'<c r="{cell_ref}"><v>{value}</v></c>')
-                continue
-            txt = "" if value is None else str(value)
-            escaped = _xml_escape(txt)
-            preserve = ' xml:space="preserve"' if (txt[:1] == " " or txt[-1:] == " ") else ""
-            cell_parts.append(
-                f'<c r="{cell_ref}" t="inlineStr"><is><t{preserve}>{escaped}</t></is></c>'
-            )
-        row_parts.append(f'<row r="{row_idx}">{"".join(cell_parts)}</row>')
-    sheet_data = "".join(row_parts)
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        f"<sheetData>{sheet_data}</sheetData>"
-        "</worksheet>"
-    )
-
-
-def _write_xlsx_file(path: Path, sheets):
-    safe_sheets = []
-    for idx, (name, rows) in enumerate(sheets, start=1):
-        sheet_name = str(name or f"Sheet{idx}")[:31]
-        sheet_rows = rows if isinstance(rows, list) else list(rows)
-        safe_sheets.append((sheet_name, sheet_rows))
-
-    sheet_entries = []
-    rel_entries = []
-    override_entries = []
-    for idx, (sheet_name, rows) in enumerate(safe_sheets, start=1):
-        rid = f"rId{idx}"
-        sheet_entries.append(
-            f'<sheet name="{_xml_escape(sheet_name)}" sheetId="{idx}" r:id="{rid}"/>'
-        )
-        rel_entries.append(
-            f'<Relationship Id="{rid}" '
-            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
-            f'Target="worksheets/sheet{idx}.xml"/>'
-        )
-        override_entries.append(
-            f'<Override PartName="/xl/worksheets/sheet{idx}.xml" '
-            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-        )
-
-    workbook_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        f"<sheets>{''.join(sheet_entries)}</sheets>"
-        "</workbook>"
-    )
-    workbook_rels_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        f"{''.join(rel_entries)}"
-        "</Relationships>"
-    )
-    root_rels_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" '
-        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
-        'Target="xl/workbook.xml"/>'
-        "</Relationships>"
-    )
-    content_types_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/xl/workbook.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        f"{''.join(override_entries)}"
-        "</Types>"
-    )
-
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with ZipFile(tmp_path, "w", compression=ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", content_types_xml)
-        zf.writestr("_rels/.rels", root_rels_xml)
-        zf.writestr("xl/workbook.xml", workbook_xml)
-        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
-        for idx, (_, rows) in enumerate(safe_sheets, start=1):
-            zf.writestr(f"xl/worksheets/sheet{idx}.xml", _build_sheet_xml(rows))
-    os.replace(tmp_path, path)
-
-
-def _parse_iso_datetime(valor):
-    if not valor:
-        return None
-    try:
-        return datetime.fromisoformat(str(valor))
-    except Exception:
-        return None
-
-
-def _formatar_duracao(segundos: float) -> str:
-    secs = max(0, int(round(float(segundos))))
-    h, rem = divmod(secs, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def _formatar_janela_solar_label(janela_inicio: dtime, janela_fim: dtime) -> str:
-    return f"{janela_inicio.strftime('%H:%M')}-{janela_fim.strftime('%H:%M')}"
 
 
 def _is_ibimirim_usina(usina_nome: str) -> bool:
@@ -662,19 +220,11 @@ def _obter_janela_solar_inversor(usina_nome: str = None):
     return INVERTER_SOLAR_WINDOW_START, INVERTER_SOLAR_WINDOW_END
 
 
-def _calcular_sobreposicao_segundos(inicio: datetime, fim: datetime, faixa_ini: datetime, faixa_fim: datetime) -> float:
-    ini = max(inicio, faixa_ini)
-    end = min(fim, faixa_fim)
-    if end <= ini:
-        return 0.0
-    return float((end - ini).total_seconds())
-
-
 def _calcular_sobreposicao_janela_solar(
     inicio: datetime,
     fim: datetime,
-    janela_inicio: dtime = SOLAR_WINDOW_START,
-    janela_fim: dtime = SOLAR_WINDOW_END,
+    janela_inicio: time = SOLAR_WINDOW_START,
+    janela_fim: time = SOLAR_WINDOW_END,
 ) -> float:
     if fim <= inicio:
         return 0.0
@@ -683,30 +233,25 @@ def _calcular_sobreposicao_janela_solar(
     while dia <= fim.date():
         faixa_ini = datetime.combine(dia, janela_inicio)
         faixa_fim = datetime.combine(dia, janela_fim)
-        total += _calcular_sobreposicao_segundos(inicio, fim, faixa_ini, faixa_fim)
+        total += calcular_sobreposicao_segundos(inicio, fim, faixa_ini, faixa_fim)
         dia += timedelta(days=1)
     return total
 
 
-# Varre leituras de rele no intervalo informado para encontrar eventos e classifica-los.
-def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, fim: datetime):
-    def _valor_ativo(valor):
-        if isinstance(valor, bool):
-            return valor
-        if isinstance(valor, (int, float)):
-            return valor == 1
-        if isinstance(valor, str):
-            txt = valor.strip().lower()
-            if txt in {"true", "1"}:
-                return True
-            try:
-                return float(txt) == 1.0
-            except Exception:
-                return False
-        return False
+def _classificar_rele_conteudo_relatorio(conteudo: Dict) -> Tuple[str | None, List[str]]:
+    ativos = [p for p in RELAY_PARAMETROS if valor_rele_ativo_relatorio(conteudo.get(p))]
+    if not ativos:
+        return None, []
+    tipo = "OUTROS"
+    for classe, lista in RELAY_PARAMS_CLASSIF.items():
+        if any(p in lista for p in ativos):
+            tipo = classe
+            break
+    return tipo, ativos
 
-    PARAMS_CLASSIF = RELAY_PARAMS_CLASSIF
-    PARAMETROS_RELE = RELAY_PARAMETROS
+
+# Varre leituras de rele no intervalo informado para encontrar eventos e classifica-los.
+def detectar_alertas_rele(api: PVOperation, plant_id: str, inicio: datetime, fim: datetime):
 
     agrupados = {}
     tem_dados = False
@@ -753,15 +298,9 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
             if not (inicio <= ts <= fim):
                 continue
 
-            ativos = [p for p in PARAMETROS_RELE if _valor_ativo(conteudo.get(p))]
-            if not ativos:
+            tipo, ativos = _classificar_rele_conteudo_relatorio(conteudo)
+            if not tipo:
                 continue
-
-            tipo = "OUTROS"
-            for classe, lista in PARAMS_CLASSIF.items():
-                if any(p in lista for p in ativos):
-                    tipo = classe
-                    break
 
             base = f"{plant_id}:{idrele}:{tipo}"
             entry = agrupados.get(base)
@@ -796,13 +335,13 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
 
 # Avalia leituras de inversores para identificar falha (Pac 0) e recuperacao (Pac > 0).
 def detectar_falhas_inversores(
-    api: PVOperationAPI,
+    api: PVOperation,
     plant_id: str,
     inicio: datetime,
     fim: datetime,
     falhas_ativas_previas: dict,
-    janela_inicio: dtime = INVERTER_SOLAR_WINDOW_START,
-    janela_fim: dtime = INVERTER_SOLAR_WINDOW_END,
+    janela_inicio: time = INVERTER_SOLAR_WINDOW_START,
+    janela_fim: time = INVERTER_SOLAR_WINDOW_END,
 ):
     JANELA_INICIO = janela_inicio
     JANELA_FIM = janela_fim
@@ -856,13 +395,11 @@ def detectar_falhas_inversores(
                     pac_raw = conteudo.get(k)
                     break
 
-            if pac_raw is None:
-                leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "cond_ok": False, "sem_dados": True, "pac": None})
-                continue
-
             pac = extrair_valor_numerico(pac_raw)
-            if pac is None:
-                leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "cond_ok": False, "sem_dados": True, "pac": None})
+
+            if not pac_raw or not pac:
+                entry = {"ts": ts, "cond_ok": False, "sem_dados": True, "pac": None}
+                leituras_por_inv.setdefault(inv_id, []).append(entry)
                 continue
 
             cond = pac == 0.0
@@ -897,7 +434,7 @@ def detectar_falhas_inversores(
         ativa = bool(prev_state.get("ativa", False))
         rec_seq = int(prev_state.get("rec_seq", 0))
         seq_zero = int(prev_state.get("seq_zero", 0))
-        ultima_confirmacao_dt = _parse_iso_datetime(prev_state.get("ultima_confirmacao_ts"))
+        ultima_confirmacao_dt = parse_iso_datetime(prev_state.get("ultima_confirmacao_ts"))
         last_valid_ts = None
 
         for item in lst:
@@ -989,10 +526,9 @@ class MonitorService:
         self.incidentes_rele_ativos = {}      # base rele -> incidente aberto
         self.incidentes_inv_ativos = {}       # usina:inv -> incidente aberto
         self.historico_incidentes = []        # incidentes concluídos (relé e inversor)
-        self.last_weekly_report_id = None
 
     # Prepara estado inicial do servico e caches de alertas.
-    def __init__(self, api_rele: PVOperationAPI, api_inversor: PVOperationAPI = None):
+    def __init__(self, api_rele: PVOperation, api_inversor: PVOperation = None):
         self.api_rele = api_rele
         self.api_inversor = api_inversor or api_rele
         self._init_state_defaults()
@@ -1006,11 +542,10 @@ class MonitorService:
     def start(self):
         self._acquire_lock()
         self._load_state()
-        atexit.register(self._shutdown_cleanup)
+        register(self._shutdown_cleanup)
         self._threads = [
             threading.Thread(target=self._loop_scans, daemon=True),
             threading.Thread(target=self._loop_heartbeat, daemon=True),
-            threading.Thread(target=self._loop_weekly_report, daemon=True),
         ]
         for t in self._threads:
             t.start()
@@ -1127,14 +662,16 @@ class MonitorService:
         for item in self.historico_incidentes:
             if not isinstance(item, dict):
                 continue
-            fim_dt = _parse_iso_datetime(item.get("fim_ts"))
+            fim_dt = parse_iso_datetime(item.get("fim_ts"))
             if fim_dt and fim_dt < limite:
                 continue
             saida.append(item)
         self.historico_incidentes = saida[-MAX_INCIDENT_HISTORY:]
 
     @staticmethod
-    def _novo_incidente(base_key: str, natureza: str, tipo_falha: str, usina_id: str, usina: str, equipamento: str, inicio_ts: datetime):
+    def _novo_incidente(
+        base_key: str, natureza: str, tipo_falha: str, usina_id: str, usina: str, equipamento: str, inicio_ts: datetime
+    ):
         inicio = inicio_ts if isinstance(inicio_ts, datetime) else datetime.now()
         return {
             "chave": str(base_key),
@@ -1146,7 +683,9 @@ class MonitorService:
             "inicio_ts": inicio.isoformat(),
         }
 
-    def _registrar_inicio_incidente_rele(self, base: str, usina_id: str, usina: str, rele_id: str, tipo_falha: str, inicio_ts: datetime):
+    def _registrar_inicio_incidente_rele(
+        self, base: str, usina_id: str, usina: str, rele_id: str, tipo_falha: str, inicio_ts: datetime
+    ):
         if base not in self.incidentes_rele_ativos:
             self.incidentes_rele_ativos[base] = self._novo_incidente(
                 base_key=base,
@@ -1167,7 +706,7 @@ class MonitorService:
                 usina_id, rele_id, tipo = partes
             else:
                 usina_id, rele_id, tipo = "N/A", str(base), "OUTROS"
-            inicio_dt = _parse_iso_datetime(alerta.get("ts_iso")) or fim_ts
+            inicio_dt = parse_iso_datetime(alerta.get("ts_iso")) or fim_ts
             incidente = self._novo_incidente(
                 base_key=base,
                 natureza="RELE",
@@ -1177,7 +716,7 @@ class MonitorService:
                 equipamento=alerta.get("rele", rele_id),
                 inicio_ts=inicio_dt,
             )
-        inicio_dt = _parse_iso_datetime(incidente.get("inicio_ts")) or fim_ts
+        inicio_dt = parse_iso_datetime(incidente.get("inicio_ts")) or fim_ts
         fim_dt = fim_ts if isinstance(fim_ts, datetime) else datetime.now()
         if fim_dt < inicio_dt:
             fim_dt = inicio_dt
@@ -1185,7 +724,9 @@ class MonitorService:
         finalizado["fim_ts"] = fim_dt.isoformat()
         self.historico_incidentes.append(finalizado)
 
-    def _registrar_inicio_incidente_inversor(self, chave_inv: str, usina_id: str, usina: str, inversor_id: str, inicio_ts: datetime):
+    def _registrar_inicio_incidente_inversor(
+        self, chave_inv: str, usina_id: str, usina: str, inversor_id: str, inicio_ts: datetime
+    ):
         if chave_inv not in self.incidentes_inv_ativos:
             self.incidentes_inv_ativos[chave_inv] = self._novo_incidente(
                 base_key=chave_inv,
@@ -1203,7 +744,7 @@ class MonitorService:
             alerta = alerta_prev if isinstance(alerta_prev, dict) else {}
             fallback_usina_id = usina_id or (chave_inv.split(":", 1)[0] if ":" in chave_inv else "N/A")
             fallback_inv = chave_inv.split(":", 1)[1] if ":" in chave_inv else chave_inv
-            inicio_dt = _parse_iso_datetime(alerta.get("ts_iso")) or fim_ts
+            inicio_dt = parse_iso_datetime(alerta.get("ts_iso")) or fim_ts
             incidente = self._novo_incidente(
                 base_key=chave_inv,
                 natureza="INVERSOR",
@@ -1213,7 +754,7 @@ class MonitorService:
                 equipamento=alerta.get("inversor", fallback_inv),
                 inicio_ts=inicio_dt,
             )
-        inicio_dt = _parse_iso_datetime(incidente.get("inicio_ts")) or fim_ts
+        inicio_dt = parse_iso_datetime(incidente.get("inicio_ts")) or fim_ts
         fim_dt = fim_ts if isinstance(fim_ts, datetime) else datetime.now()
         if fim_dt < inicio_dt:
             fim_dt = inicio_dt
@@ -1278,7 +819,7 @@ class MonitorService:
             raw = STATE_FILE.read_text(encoding="utf-8")
             if not raw.strip():
                 raise ValueError("state vazio")
-            data = json.loads(raw)
+            data = loads(raw)
             if not isinstance(data, dict):
                 raise ValueError("state inválido")
             schema_version = data.get("schema_version")
@@ -1333,10 +874,6 @@ class MonitorService:
                     for chave, payload in inv_norm.items():
                         if isinstance(payload, dict):
                             self.pending_notifications["inv_normalizados"][str(chave)] = payload
-            self.last_weekly_report_id = data.get("last_weekly_report_id")
-            if self.last_weekly_report_id is not None:
-                self.last_weekly_report_id = str(self.last_weekly_report_id)
-
             self.historico_incidentes = []
             raw_historico = data.get("historico_incidentes", [])
             if isinstance(raw_historico, list):
@@ -1470,7 +1007,7 @@ class MonitorService:
                     continue
                 usina_id, rele_id, tipo = partes
                 alerta = self.rele_alerta_chave.get(base, {})
-                inicio = _parse_iso_datetime(alerta.get("ts_iso")) or datetime.now()
+                inicio = parse_iso_datetime(alerta.get("ts_iso")) or datetime.now()
                 self.incidentes_rele_ativos[base] = self._novo_incidente(
                     base_key=base,
                     natureza="RELE",
@@ -1491,7 +1028,7 @@ class MonitorService:
                 usina_id = chave_inv.split(":", 1)[0] if ":" in chave_inv else "N/A"
                 inv_id = chave_inv.split(":", 1)[1] if ":" in chave_inv else chave_inv
                 alerta = estado.get("alerta") if isinstance(estado.get("alerta"), dict) else {}
-                inicio = _parse_iso_datetime(alerta.get("ts_iso")) or datetime.now()
+                inicio = parse_iso_datetime(alerta.get("ts_iso")) or datetime.now()
                 self.incidentes_inv_ativos[chave_inv] = self._novo_incidente(
                     base_key=chave_inv,
                     natureza="INVERSOR",
@@ -1506,7 +1043,7 @@ class MonitorService:
             self._limitar_pendencias()
             self._limitar_historico_incidentes()
             logger.info("Estado carregado do disco.")
-        except (json.JSONDecodeError, ValueError) as e:
+        except (JSONDecodeError, ValueError) as e:
             self._backup_corrupt_state(str(e))
             self._init_state_defaults()
             self._save_state()
@@ -1536,11 +1073,10 @@ class MonitorService:
                 "incidentes_rele_ativos": self.incidentes_rele_ativos,
                 "incidentes_inv_ativos": self.incidentes_inv_ativos,
                 "historico_incidentes": self.historico_incidentes,
-                "last_weekly_report_id": self.last_weekly_report_id,
             }
             tmp_path = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
             with self._state_lock:
-                tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+                tmp_path.write_text(dumps(payload), encoding="utf-8")
                 os.replace(tmp_path, STATE_FILE)
         except Exception as e:
             logger.warning(f"Falha ao salvar estado: {e}")
@@ -1571,25 +1107,6 @@ class MonitorService:
             if self.stop_event.wait(espera):
                 break
 
-    def _loop_rele(self):  # pragma: no cover
-        """LEGACY/DEPRECATED: use _loop_scans; mantido por compatibilidade."""
-        while not self.stop_event.is_set():
-            try:
-                self.executar_varredura_rele()
-            except Exception:
-                logger.exception("Erro na varredura de relé")
-            self.stop_event.wait(RELAY_INTERVAL)
-
-    # Loop continuo que dispara varredura de inversores no intervalo definido.
-    def _loop_inversor(self):  # pragma: no cover
-        """LEGACY/DEPRECATED: use _loop_scans; mantido por compatibilidade."""
-        while not self.stop_event.is_set():
-            try:
-                self.executar_varredura_inversor()
-            except Exception:
-                logger_inv.exception("Erro na varredura de inversor")
-            self.stop_event.wait(INVERTER_INTERVAL)
-
     # Loop de heartbeat para enviar notificacao em horarios fixos.
     def _loop_heartbeat(self):
         while not self.stop_event.is_set():
@@ -1603,74 +1120,18 @@ class MonitorService:
             except Exception:
                 logger.exception("Erro ao enviar heartbeat")
 
-    # Loop dedicado para gerar relatório semanal de forma automática.
-    def _loop_weekly_report(self):
-        while not self.stop_event.is_set():
-            try:
-                self._gerar_relatorio_semanal_se_pendente()
-            except Exception:
-                logger.exception("Erro ao gerar relatorio semanal")
-            if self.stop_event.wait(WEEKLY_REPORT_CHECK_INTERVAL):
-                break
-
-    @staticmethod
-    def _inicio_semana(dt_ref: datetime) -> datetime:
-        return datetime.combine(dt_ref.date() - timedelta(days=dt_ref.weekday()), datetime.min.time())
-
-    def _periodo_relatorio_pendente(self, agora: datetime):
-        inicio_semana_atual = self._inicio_semana(agora)
-        liberacao = datetime.combine(inicio_semana_atual.date(), WEEKLY_REPORT_GENERATION_TIME)
-        if agora < liberacao:
-            return None
-        inicio_semana_relatorio = inicio_semana_atual - timedelta(days=7)
-        report_id = inicio_semana_relatorio.date().isoformat()
-        if self.last_weekly_report_id == report_id:
-            return None
-        return inicio_semana_relatorio, inicio_semana_atual, report_id
-
-    @staticmethod
-    def _fmt_ts(valor):
-        if isinstance(valor, datetime):
-            return valor.strftime("%d/%m/%Y %H:%M:%S")
-        return ""
-
-    @staticmethod
-    def _valor_rele_ativo_relatorio(valor):
-        if isinstance(valor, bool):
-            return valor
-        if isinstance(valor, (int, float)):
-            return valor == 1
-        if isinstance(valor, str):
-            txt = valor.strip().lower()
-            if txt in {"true", "1"}:
-                return True
-            try:
-                return float(txt) == 1.0
-            except Exception:
-                return False
-        return False
-
-    def _classificar_rele_conteudo_relatorio(self, conteudo):
-        if not isinstance(conteudo, dict):
-            return None
-        ativos = [p for p in RELAY_PARAMETROS if self._valor_rele_ativo_relatorio(conteudo.get(p))]
-        if not ativos:
-            return None
-        tipo = "OUTROS"
-        for classe, lista in RELAY_PARAMS_CLASSIF.items():
-            if any(p in lista for p in ativos):
-                tipo = classe
-                break
-        return tipo
-
-    def _coletar_incidentes_rele_semana_api(self, usina_id: str, usina_nome: str, inicio_semana: datetime, fim_semana: datetime):
+    def _coletar_incidentes_rele_semana_api(
+        self, usina_id: str, usina_nome: str, inicio_semana: datetime, fim_semana: datetime
+    ):
         inicio_busca = inicio_semana - timedelta(days=WEEKLY_REPORT_WARMUP_DAYS)
         fim_busca = fim_semana - timedelta(seconds=1)
         leituras_por_rele = defaultdict(list)
 
         dia = inicio_busca.date()
         while dia <= fim_busca.date():
-            data_resp, timeout_flag = self.api_rele.post_day("day_relay", int(usina_id), datetime.combine(dia, datetime.min.time()))
+            data_resp, timeout_flag = self.api_rele.post_day(
+                "day_relay", int(usina_id), datetime.combine(dia, datetime.min.time())
+            )
             if timeout_flag:
                 logger_rele.warning(
                     f"Timeout parcial no backfill semanal de rele (usina {usina_id}, dia {dia})."
@@ -1696,7 +1157,7 @@ class MonitorService:
                     continue
                 if ts < inicio_busca or ts > fim_busca:
                     continue
-                tipo = self._classificar_rele_conteudo_relatorio(conteudo)
+                tipo, _ = _classificar_rele_conteudo_relatorio(conteudo)
                 leituras_por_rele[str(rele_id)].append((ts, tipo))
             dia += timedelta(days=1)
 
@@ -1743,7 +1204,9 @@ class MonitorService:
                 )
         return incidentes
 
-    def _coletar_incidentes_inversor_semana_api(self, usina_id: str, usina_nome: str, inicio_semana: datetime, fim_semana: datetime):
+    def _coletar_incidentes_inversor_semana_api(
+        self, usina_id: str, usina_nome: str, inicio_semana: datetime, fim_semana: datetime
+    ):
         inicio_busca = inicio_semana - timedelta(days=WEEKLY_REPORT_WARMUP_DAYS)
         fim_busca = fim_semana - timedelta(seconds=1)
         janela_inicio, janela_fim = _obter_janela_solar_inversor(usina_nome)
@@ -1806,10 +1269,8 @@ class MonitorService:
             )
         return incidentes
 
-    def _coletar_incidentes_semana_api(self, inicio_semana: datetime, fim_semana: datetime):
+    def _coletar_incidentes_semana_api(self, inicio_semana: datetime, fim_semana: datetime) -> List:
         plantas = self.api_rele.get_plants()
-        if plantas is None:
-            return None
         if not plantas:
             return []
 
@@ -1847,17 +1308,18 @@ class MonitorService:
                 logger_inv.warning(
                     f"Falha no backfill semanal de inversor para usina {usina_id}: {e}"
                 )
+
         return incidentes
 
-    def _coletar_incidentes_semana_state(self, inicio_semana: datetime, fim_semana: datetime):
+    def _coletar_incidentes_semana_state(self, inicio_semana: datetime, fim_semana: datetime) -> List:
         incidentes = []
         for item in list(self.historico_incidentes):
             if not isinstance(item, dict):
                 continue
-            inicio_dt = _parse_iso_datetime(item.get("inicio_ts"))
+            inicio_dt = parse_iso_datetime(item.get("inicio_ts"))
             if not inicio_dt:
                 continue
-            fim_dt = _parse_iso_datetime(item.get("fim_ts")) or fim_semana
+            fim_dt = parse_iso_datetime(item.get("fim_ts")) or fim_semana
             if fim_dt <= inicio_semana or inicio_dt >= fim_semana:
                 continue
             incidentes.append(dict(item))
@@ -1865,10 +1327,10 @@ class MonitorService:
         for item in list(self.incidentes_rele_ativos.values()) + list(self.incidentes_inv_ativos.values()):
             if not isinstance(item, dict):
                 continue
-            inicio_dt = _parse_iso_datetime(item.get("inicio_ts"))
+            inicio_dt = parse_iso_datetime(item.get("inicio_ts"))
             if not inicio_dt:
                 continue
-            fim_dt = _parse_iso_datetime(item.get("fim_ts")) or fim_semana
+            fim_dt = parse_iso_datetime(item.get("fim_ts")) or fim_semana
             if fim_dt <= inicio_semana or inicio_dt >= fim_semana:
                 continue
             incidentes.append(dict(item))
@@ -1876,7 +1338,7 @@ class MonitorService:
         return incidentes
 
     @staticmethod
-    def _incidente_overlap_key(item):
+    def _incidente_overlap_key(item: Dict) -> Tuple:
         return (
             str(item.get("natureza", "")),
             str(item.get("usina_id", "")),
@@ -1884,19 +1346,15 @@ class MonitorService:
             str(item.get("tipo_falha", "")),
         )
 
-    @staticmethod
-    def _intervalos_se_sobrepoem(inicio_a, fim_a, inicio_b, fim_b):
-        return inicio_a <= fim_b and inicio_b <= fim_a
-
-    def _mesclar_incidentes_relatorio(self, incidentes, fim_semana: datetime):
+    def _mesclar_incidentes_relatorio(self, incidentes: List, fim_semana: datetime) -> List:
         grupos = defaultdict(list)
         for item in incidentes:
             if not isinstance(item, dict):
                 continue
-            inicio_dt = _parse_iso_datetime(item.get("inicio_ts"))
+            inicio_dt = parse_iso_datetime(item.get("inicio_ts"))
             if not inicio_dt:
                 continue
-            fim_dt = _parse_iso_datetime(item.get("fim_ts")) or fim_semana
+            fim_dt = parse_iso_datetime(item.get("fim_ts")) or fim_semana
             if fim_dt < inicio_dt:
                 fim_dt = inicio_dt
             grupos[self._incidente_overlap_key(item)].append(
@@ -1904,7 +1362,7 @@ class MonitorService:
                     "raw": dict(item),
                     "inicio": inicio_dt,
                     "fim": fim_dt,
-                    "fim_real": _parse_iso_datetime(item.get("fim_ts")),
+                    "fim_real": parse_iso_datetime(item.get("fim_ts")),
                 }
             )
 
@@ -1915,7 +1373,7 @@ class MonitorService:
             for item in itens:
                 merged = False
                 for acc in acumulados:
-                    if not self._intervalos_se_sobrepoem(acc["inicio"], acc["fim"], item["inicio"], item["fim"]):
+                    if not intervalos_se_sobrepoem(acc["inicio"], acc["fim"], item["inicio"], item["fim"]):
                         continue
                     acc["inicio"] = min(acc["inicio"], item["inicio"])
                     acc["fim"] = max(acc["fim"], item["fim"])
@@ -1939,24 +1397,26 @@ class MonitorService:
             key=lambda x: (
                 str(x.get("usina", "")),
                 str(x.get("natureza", "")),
-                _parse_iso_datetime(x.get("inicio_ts")) or datetime.min,
+                parse_iso_datetime(x.get("inicio_ts")) or datetime.min,
             ),
         )
 
-    def _montar_relatorio_semanal(self, inicio_semana: datetime, fim_semana: datetime, historico, ativos_rele, ativos_inv):
+    def _montar_relatorio_semanal(
+        self, inicio_semana: datetime, fim_semana: datetime, historico, ativos_rele, ativos_inv
+    ) -> Tuple[List[List], List[List], str]:
         ocorrencias = []
         dedupe = set()
 
         def _add_occ(base):
             if not isinstance(base, dict):
                 return
-            inicio_dt = _parse_iso_datetime(base.get("inicio_ts"))
+            inicio_dt = parse_iso_datetime(base.get("inicio_ts"))
             if not inicio_dt:
                 return
-            fim_dt = _parse_iso_datetime(base.get("fim_ts")) or fim_semana
+            fim_dt = parse_iso_datetime(base.get("fim_ts")) or fim_semana
             if fim_dt < inicio_dt:
                 fim_dt = inicio_dt
-            clip_total = _calcular_sobreposicao_segundos(inicio_dt, fim_dt, inicio_semana, fim_semana)
+            clip_total = calcular_sobreposicao_segundos(inicio_dt, fim_dt, inicio_semana, fim_semana)
             if clip_total <= 0:
                 return
             clip_ini = max(inicio_dt, inicio_semana)
@@ -1987,7 +1447,7 @@ class MonitorService:
                     "tipo_falha": str(base.get("tipo_falha", "")),
                     "equipamento": str(base.get("equipamento", "")),
                     "inicio": inicio_dt,
-                    "fim": _parse_iso_datetime(base.get("fim_ts")),
+                    "fim": parse_iso_datetime(base.get("fim_ts")),
                     "clip_ini": clip_ini,
                     "clip_fim": clip_fim,
                     "dur_total_sec": clip_total,
@@ -2036,8 +1496,8 @@ class MonitorService:
                     natureza,
                     tipo_falha,
                     int(agg["qtd"]),
-                    _formatar_duracao(agg["dur_total_sec"]),
-                    _formatar_duracao(agg["dur_solar_sec"]),
+                    formatar_duracao(agg["dur_total_sec"]),
+                    formatar_duracao(agg["dur_solar_sec"]),
                     round(agg["dur_solar_sec"] / 3600.0, 2),
                 ]
             )
@@ -2057,9 +1517,9 @@ class MonitorService:
             ]
         ]
         for it in sorted(ocorrencias, key=lambda x: x["clip_ini"]):
-            inicio_txt = self._fmt_ts(it["inicio"])
-            fim_txt = self._fmt_ts(it["fim"]) if it["fim"] else "EM ABERTO"
-            periodo_txt = f"{self._fmt_ts(it['clip_ini'])} ate {self._fmt_ts(it['clip_fim'])}"
+            inicio_txt = fmt_ts(it["inicio"])
+            fim_txt = fmt_ts(it["fim"]) if it["fim"] else "EM ABERTO"
+            periodo_txt = f"{fmt_ts(it['clip_ini'])} ate {fmt_ts(it['clip_fim'])}"
             ocorrencias_rows.append(
                 [
                     it["usina"],
@@ -2069,25 +1529,23 @@ class MonitorService:
                     inicio_txt,
                     fim_txt,
                     periodo_txt,
-                    _formatar_duracao(it["dur_total_sec"]),
-                    _formatar_duracao(it["dur_solar_sec"]),
+                    formatar_duracao(it["dur_total_sec"]),
+                    formatar_duracao(it["dur_solar_sec"]),
                     round(it["dur_solar_sec"] / 3600.0, 2),
                 ]
             )
 
         return resumo_rows, ocorrencias_rows, semana_txt
 
-    def _gerar_relatorio_semanal_se_pendente(self, ref: datetime = None):
+    def gerar_relatorio_semanal(self, ref: datetime = None) -> None:
         agora = ref or datetime.now()
+        fim_semana = inicio_semana(agora)
+        inicio_semana_relatorio = fim_semana - timedelta(days=7)
         with self._scan_lock:
-            pendente = self._periodo_relatorio_pendente(agora)
-            if not pendente:
-                return False
-            inicio_semana, fim_semana, report_id = pendente
-            incidentes_api = self._coletar_incidentes_semana_api(inicio_semana, fim_semana)
-            incidentes_state = self._coletar_incidentes_semana_state(inicio_semana, fim_semana)
+            incidentes_api = self._coletar_incidentes_semana_api(inicio_semana_relatorio, fim_semana)
+            incidentes_state = self._coletar_incidentes_semana_state(inicio_semana_relatorio, fim_semana)
 
-            if incidentes_api is None:
+            if not incidentes_api:
                 incidentes_finais = self._mesclar_incidentes_relatorio(incidentes_state, fim_semana)
                 logger.warning(
                     "Relatorio semanal usando apenas state local (coleta direta da API indisponivel)."
@@ -2104,28 +1562,18 @@ class MonitorService:
                 )
 
         resumo_rows, ocorrencias_rows, semana_txt = self._montar_relatorio_semanal(
-            inicio_semana, fim_semana, incidentes_finais, {}, {}
-        )
-        fim_legivel = (fim_semana - timedelta(days=1)).strftime("%Y%m%d")
-        arquivo = REPORT_DIR / f"relatorio_semanal_{inicio_semana.strftime('%Y%m%d')}_{fim_legivel}.xlsx"
-        _write_xlsx_file(
-            arquivo,
-            [
-                ("Resumo", resumo_rows),
-                ("Ocorrencias", ocorrencias_rows),
-            ],
+            inicio_semana_relatorio, fim_semana, incidentes_finais, {}, {}
         )
 
-        with self._scan_lock:
-            if self.last_weekly_report_id == report_id:
-                return True
-            self.last_weekly_report_id = report_id
-            self._save_state()
+        fim_legivel = (fim_semana - timedelta(days=1)).strftime("%Y%m%d")
+        file_path = REPORT_DIR / f"relatorio_semanal_{inicio_semana_relatorio.strftime('%Y%m%d')}_{fim_legivel}.xlsx"
+        write_xlsx_file(file_path, [("Resumo", resumo_rows), ("Ocorrencias", ocorrencias_rows)])
+        OutlookMailService().send_weekly_report(file_path, semana_txt)
+
         logger.info(
-            f"Relatorio semanal gerado: {arquivo} | Janela solar rele: {SOLAR_WINDOW_LABEL} | "
+            f"Relatorio semanal gerado: {file_path} | Janela solar rele: {SOLAR_WINDOW_LABEL} | "
             f"Janela solar inversor: {INVERTER_SOLAR_WINDOW_LABEL} | Semana: {semana_txt}"
         )
-        return True
 
     # Busca alertas de rele nas usinas e dispara notificacoes unicas por evento.
     def executar_varredura_rele(self):
@@ -2137,14 +1585,12 @@ class MonitorService:
             else:
                 inicio_padrao = datetime.combine(agora.date(), datetime.min.time())
             logger_rele.info("Varredura de rele iniciada.")
-            sem_plantas = False
             pend_norm = self.pending_notifications.setdefault("rele_normalizados", {})
-            teve_erro_api = False
             teve_timeout_api = False
 
             plantas = self.api_rele.get_plants()
-            if plantas is None:
-                teve_erro_api = True
+
+            if not plantas:
                 teve_timeout_api = bool(self.api_rele.last_get_plants_timeout)
                 motivo = "TIMEOUT" if teve_timeout_api else "ERRO_API"
                 logger_rele.warning(
@@ -2152,14 +1598,6 @@ class MonitorService:
                 )
                 # mantem/recalcula bloqueios a partir dos alertas ativos conhecidos
                 self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
-                sem_plantas = True
-                plantas = []
-            elif not plantas:
-                logger_rele.warning("Nenhuma usina encontrada (rele).")
-                # mantem/recalcula bloqueios a partir dos alertas ativos conhecidos
-                self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
-                sem_plantas = True
-                plantas = []
 
             bases_ativos_atual = set()
             novos_por_usina = {}
@@ -2206,7 +1644,7 @@ class MonitorService:
                     bases_ativos_atual.add(base)
                     ts_first = a.get("ts_primeiro", a["ts_leitura"])
                     ts_last = a.get("ts_ultimo", a["ts_leitura"])
-                    intervalo_txt = self.formatar_intervalo_alerta(ts_first, ts_last)
+                    intervalo_txt = formatar_intervalo_alerta(ts_first, ts_last)
                     alerta_fmt = {
                         "base": base,
                         "usina": nome,
@@ -2255,7 +1693,9 @@ class MonitorService:
                 for base in self.rele_alertas_ativos:
                     if base.split(":", 1)[0] in usinas_sem_dados:
                         bases_ativos_atual.add(base)
+
             resolved = self.rele_alertas_ativos - bases_ativos_atual
+
             for base in resolved:
                 alerta_antigo = self.rele_alerta_chave.get(base)
                 self.rele_alertas_ativos.discard(base)
@@ -2265,7 +1705,11 @@ class MonitorService:
                 if alerta_antigo:
                     usina_id, rele_id, tipo = base.split(":", 2)
                     resolvidos_por_usina.setdefault(
-                        usina_id, {"usina": alerta_antigo.get("usina"), "capacidade": alerta_antigo.get("capacidade"), "itens": []}
+                        usina_id, {
+                            "usina": alerta_antigo.get("usina"),
+                            "capacidade": alerta_antigo.get("capacidade"),
+                            "itens": []
+                        }
                     )["itens"].append(
                         {
                             "base": base,
@@ -2275,7 +1719,7 @@ class MonitorService:
                             "tipo": alerta_antigo.get("tipo", tipo),
                             "horario": alerta_antigo.get("horario"),
                             "ts_iso": alerta_antigo.get("ts_iso"),
-                            "parametros": alerta_antigo.get("parametros"),
+                            "parametros": alerta_antigo.get("parametros")
                         }
                     )
             # recalcula usinas com rele ativo a partir do conjunto de alertas ativos
@@ -2314,6 +1758,7 @@ class MonitorService:
 
                 pacote["novos"] = _dedupe_por_base(pacote["novos"])
                 pacote["normalizados"] = _dedupe_por_base(pacote["normalizados"])
+
                 def _ts_key(item):
                     ts = item.get("ts_iso")
                     if not ts:
@@ -2353,8 +1798,9 @@ class MonitorService:
                             if base:
                                 existentes.add(base)
 
-            if not sem_plantas:
+            if plantas:
                 self.ultima_varredura_rele = agora
+
             # salva estado ao fim da varredura para evitar retrabalho após quedas
             self._save_state()
             logger_rele.info("Varredura de rele concluida.")
@@ -2368,9 +1814,7 @@ class MonitorService:
             else:
                 inicio_padrao = datetime.combine(agora.date(), datetime.min.time())
             logger_inv.info("Varredura de inversor iniciada.")
-            sem_plantas = False
             pend_norm = self.pending_notifications.setdefault("inv_normalizados", {})
-            teve_erro_api = False
             teve_timeout_api = False
 
             def _reenviar_normalizacoes_pendentes():
@@ -2389,17 +1833,11 @@ class MonitorService:
                         pend_norm.pop(chave, None)
 
             plantas = self.api_inversor.get_plants()
-            if plantas is None:
-                teve_erro_api = True
+
+            if not plantas:
                 teve_timeout_api = bool(self.api_inversor.last_get_plants_timeout)
                 motivo = "TIMEOUT" if teve_timeout_api else "ERRO_API"
                 logger_inv.warning(f"Erro ao buscar plantas (inversor). Motivo: {motivo}.")
-                sem_plantas = True
-                plantas = []
-            elif not plantas:
-                logger_inv.warning("Nenhuma usina encontrada (inversor).")
-                sem_plantas = True
-                plantas = []
 
             for p in plantas:
                 usina_id_raw = p.get("id")
@@ -2417,7 +1855,7 @@ class MonitorService:
                 nome = p.get("nome")
                 cap = p.get("capacidade")
                 janela_inicio_inv, janela_fim_inv = _obter_janela_solar_inversor(nome)
-                janela_label_inv = _formatar_janela_solar_label(janela_inicio_inv, janela_fim_inv)
+                janela_label_inv = formatar_janela_solar_label(janela_inicio_inv, janela_fim_inv)
 
                 last_usina = self.ultima_varredura_inversor_por_usina.get(usina_id)
                 if last_usina:
@@ -2563,20 +2001,12 @@ class MonitorService:
                     self.ultima_varredura_inversor_por_usina[usina_id] = agora
 
             _reenviar_normalizacoes_pendentes()
-            if not sem_plantas:
+
+            if plantas:
                 self.ultima_varredura_inversor = agora
             # salva estado ao fim da varredura para evitar retrabalho após quedas
             self._save_state()
             logger.info("Varredura de inversor concluída.")
-
-    # Formata intervalo de tempo das leituras para texto amigavel.
-    @staticmethod
-    def formatar_intervalo_alerta(ts_first, ts_last) -> str:
-        if not ts_first or not ts_last:
-            return ""
-        if ts_first == ts_last:
-            return f"Alerta às {ts_first.strftime('%H:%M')}"
-        return f"Primeiro alerta às {ts_first.strftime('%H:%M')} e último às {ts_last.strftime('%H:%M')}"
 
     @staticmethod
     def _inversor_conta_no_heartbeat(estado, referencia: datetime) -> bool:
@@ -2584,7 +2014,7 @@ class MonitorService:
             return False
         if not estado.get("ativa"):
             return False
-        ultima_confirmacao = _parse_iso_datetime(estado.get("ultima_confirmacao_ts"))
+        ultima_confirmacao = parse_iso_datetime(estado.get("ultima_confirmacao_ts"))
         if not ultima_confirmacao or not isinstance(referencia, datetime):
             return False
         return (referencia - ultima_confirmacao) <= INVERTER_HEARTBEAT_CONFIRMATION_TTL
@@ -2644,7 +2074,7 @@ class MonitorService:
             "Status: OK",
             f"Última varredura relé: {ultima_rele.strftime('%d/%m %H:%M:%S') if ultima_rele else 'N/D'}",
             f"Última varredura inversor: {ultima_inv.strftime('%d/%m %H:%M:%S') if ultima_inv else 'N/D'}",
-            f"Host/PID: {socket.gethostname()} / {os.getpid()}",
+            f"Host/PID: {gethostname()} / {os.getpid()}",
             f"Heartbeat previsto: {previsto.strftime('%d/%m %H:%M')}",
             "",
             f"**Alertas de relé ativos: {ativos_rele}**",
@@ -2661,7 +2091,7 @@ class MonitorService:
         texto = "  \n".join(info)
         logger.info(f"[HEARTBEAT] {texto.replace('  \n', ' | ')}")
         try:
-            _teams_post_card(
+            ms_teams.post_card(
                 title="Heartbeat: monitor rodando",
                 text=texto,
                 severity="info",
@@ -2683,16 +2113,16 @@ class MonitorService:
                 blocos.append(
                     "  \n".join(
                         [
-                            f"Relé: {it.get('rele','N/A')}",
-                            f"Tipo: {it.get('tipo','N/A')}",
-                            f"Horário: {it.get('horario','?')}",
-                            f"Parâmetros: {it.get('parametros','')}",
+                            f"Relé: {it.get('rele', 'N/A')}",
+                            f"Tipo: {it.get('tipo', 'N/A')}",
+                            f"Horário: {it.get('horario', '?')}",
+                            f"Parâmetros: {it.get('parametros', '')}",
                         ]
                     )
                 )
             return "  \n  \n".join(blocos)
 
-        cap_txt = f"{pacote.get('capacidade','N/A')} kWp"
+        cap_txt = f"{pacote.get('capacidade', 'N/A')} kWp"
         facts = [("Capacidade", cap_txt)]
         usina = pacote.get("usina", "N/A")
         severos = {"SOBRETENSÃO", "TÉRMICO", "BLOQUEIO"}
@@ -2706,7 +2136,7 @@ class MonitorService:
                 + texto.replace("  \n", " | ")
             )
             try:
-                ok_novos = _teams_post_card(
+                ok_novos = ms_teams.post_card(
                     title=f"⚠️ Falha de relé - {usina}",
                     text=f"  \n{texto}",
                     severity=severity_falha,
@@ -2724,7 +2154,7 @@ class MonitorService:
                 + texto.replace("  \n", " | ")
             )
             try:
-                ok_norm = _teams_post_card(
+                ok_norm = ms_teams.post_card(
                     title=f"✔️ Normalização de relé - {usina}",
                     text=f"  \n{texto}",
                     severity="info",
@@ -2739,9 +2169,9 @@ class MonitorService:
     # Monta mensagem de falha de inversor (Pac zerado) e envia para Teams.
     def _notificar_inversor(self, alerta):
         inds = alerta.get("indicadores", {})
-        detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
+        detalhes_txt = f"Pac: {inds.get('pac', 'N/A')}"
         janela_inicio, janela_fim = _obter_janela_solar_inversor(alerta.get("usina"))
-        janela_label = alerta.get("janela_solar_label", _formatar_janela_solar_label(janela_inicio, janela_fim))
+        janela_label = alerta.get("janela_solar_label", formatar_janela_solar_label(janela_inicio, janela_fim))
         msg = (
             f"Usina: {alerta['usina']}\n"
             f"Inversor: {alerta['inversor']}\n"
@@ -2751,7 +2181,7 @@ class MonitorService:
         )
         logger_inv.warning(f"[ALERTA INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
-            return _teams_post_card(
+            return ms_teams.post_card(
                 title=f"⚠️ Falha de Inversor (Pac=0; {INVERTER_CONSECUTIVE_READINGS} leituras; {janela_label})",
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
@@ -2769,9 +2199,9 @@ class MonitorService:
     # Comunica quando um inversor voltou a produzir apos falha de Pac 0.
     def _notificar_inversor_recuperado(self, alerta, alerta_prev=None):
         inds = alerta.get("indicadores", {})
-        detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
+        detalhes_txt = f"Pac: {inds.get('pac', 'N/A')}"
         janela_inicio, janela_fim = _obter_janela_solar_inversor(alerta.get("usina"))
-        janela_label = alerta.get("janela_solar_label", _formatar_janela_solar_label(janela_inicio, janela_fim))
+        janela_label = alerta.get("janela_solar_label", formatar_janela_solar_label(janela_inicio, janela_fim))
         msg = (
             f"Usina: {alerta['usina']}\n"
             f"Inversor: {alerta['inversor']}\n"
@@ -2781,7 +2211,7 @@ class MonitorService:
         )
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
-            return _teams_post_card(
+            return ms_teams(
                 title=f"✔️ Normalização de Inversor (Pac=0; {INVERTER_CONSECUTIVE_READINGS} leituras; {janela_label})",
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
@@ -2800,8 +2230,8 @@ class MonitorService:
 # Ponto de entrada do script: instancia API, inicia servico e aguarda interrupcao.
 def main():
     validate_config()
-    api_rele = PVOperationAPI(email=PVOP_EMAIL, password=PVOP_PASSWORD, base_url=PVOP_BASE_URL)
-    api_inv = PVOperationAPI(email=PVOP_EMAIL, password=PVOP_PASSWORD, base_url=PVOP_BASE_URL)
+    api_rele = PVOperation(email=PVOP_EMAIL, password=PVOP_PASSWORD, base_url=PVOP_BASE_URL)
+    api_inv = PVOperation(email=PVOP_EMAIL, password=PVOP_PASSWORD, base_url=PVOP_BASE_URL)
     service = MonitorService(api_rele, api_inv)
 
     def _handle_exit(signum=None, frame=None):
@@ -2813,8 +2243,8 @@ def main():
         sys.exit(0)
 
     try:
-        signal.signal(signal.SIGINT, _handle_exit)
-        signal.signal(signal.SIGTERM, _handle_exit)
+        signal(SIGINT, _handle_exit)
+        signal(SIGTERM, _handle_exit)
     except Exception:
         logger.warning("Nao foi possivel registrar sinais de encerramento.")
 
@@ -2822,7 +2252,7 @@ def main():
     logger.info("Monitor headless iniciado. Pressione Ctrl+C para sair.")
     try:
         while True:
-            time.sleep(1)
+            sleep(1)
     except KeyboardInterrupt:
         _handle_exit()
 
@@ -2833,4 +2263,4 @@ if __name__ == "__main__":
 
 # sanity check:
 # - Alertas de rele: ts_primeiro/ts_ultimo adicionados e parametros agregados sem duplicatas; ts_leitura aponta para o ultimo evento.
-# - PVOperationAPI._request_with_retry faz retry/backoff em Timeout, ConnectionError/RequestException, HTTP 5xx e 429 (Retry-After quando presente).
+# - PVOperation._request_with_retry faz retry/backoff em Timeout, ConnectionError/RequestException, HTTP 5xx e 429 (Retry-After quando presente).
