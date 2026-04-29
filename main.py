@@ -60,7 +60,7 @@ INVERTER_INTERVAL = 900       # 15 min
 STOP_JOIN_TIMEOUT = 35        # aguarda encerramento das threads antes de forcar saida
 HEARTBEAT_TIMES = [
     time(7, 0),
-    time(13, 40),
+    time(12, 30),
     time(17, 0),
     time(20, 0),
     time(23, 0)
@@ -2234,7 +2234,7 @@ class MonitorService:
         )
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
-            return ms_teams(
+            return ms_teams.post_card(
                 title=f"✔️ Normalização de Inversor (Pac=0; {INVERTER_CONSECUTIVE_READINGS} leituras; {janela_label})",
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
