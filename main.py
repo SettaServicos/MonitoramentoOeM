@@ -57,7 +57,7 @@ STOP_JOIN_TIMEOUT = 35        # aguarda encerramento das threads antes de forcar
 HEARTBEAT_TIMES = [
     dtime(7, 0),
     dtime(12, 0),
-    dtime(16, 10),
+    dtime(17, 0),
     dtime(20, 0),
     dtime(23, 0)
 ]
