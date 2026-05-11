@@ -1,129 +1,209 @@
-# Monitor de Usinas Fotovoltaicas (FV) - Headless
+# Monitor de Usinas Fotovoltaicas — main.py
 
-## 1. Visão Geral e Objetivo
+Monitor headless que varre relés e inversores via API PVOperation e envia alertas para Microsoft Teams. Roda como serviço contínuo sem UI.
 
-Este projeto consiste em um monitor Python headless, projetado para operar 24 horas por dia, 7 dias por semana, em um ambiente de servidor. Seu objetivo principal é monitorar o status de relés e inversores em usinas fotovoltaicas, consultando a API PVOperation, e enviar alertas e mensagens de heartbeat para o Microsoft Teams via Incoming Webhook. O monitor visa garantir a detecção proativa de falhas e a comunicação eficiente do status operacional das usinas.
+---
 
-## 2. Funcionalidades
+## O que o sistema faz
 
-*   **Monitoramento de Relés:** Varredura periódica para identificar alertas em relés das usinas.
-*   **Monitoramento de Inversores:** Varredura periódica para detectar falhas (potência zero) e normalizações em inversores.
-*   **Notificações no Microsoft Teams:** Envio de alertas de falha, normalização e mensagens de heartbeat para um canal configurado no Teams.
-*   **Persistência de Estado:** Mantém o estado do monitor (últimas varreduras, alertas ativos, notificações pendentes) em disco para resiliência a reinícios.
-*   **Deduplicação de Alertas:** Evita o envio de notificações repetidas para o mesmo evento ativo.
-*   **Heartbeat:** Envio de mensagens periódicas para o Teams, indicando que o monitor está ativo e funcionando.
-*   **Resiliência:** Mecanismos de retry com backoff para chamadas de API e envio de notificações para o Teams.
-*   **Instância Única:** Garante que apenas uma instância do monitor esteja em execução por vez.
+- Detecta falhas e normalizações em **relés** de proteção.
+- Detecta falhas e normalizações em **inversores** (potência zero dentro da janela solar).
+- Envia **notificações para o Teams** via Incoming Webhook.
+- Envia **heartbeat** em horários fixos para confirmar que o monitor está ativo.
+- Persiste estado em disco para sobreviver a reinícios sem reeditar alertas.
+- Gera **relatório semanal** compactado com histórico de incidentes.
+- Garante **instância única** via lock de arquivo.
 
-## 3. Como Funciona (Arquitetura)
+---
 
-O monitor opera com uma arquitetura baseada em threads e persistência de estado:
+## Arquivo de produção recomendado
 
-*   **Inicialização:** Ao iniciar, o script valida as configurações, realiza o login na API PVOperation e carrega o estado persistido do arquivo `monitor_state.json`.
-*   **Threads de Execução:** Duas threads principais são iniciadas:
-    *   `_loop_scans`: Responsável por agendar e executar as varreduras de relés e inversores em intervalos definidos.
-    *   `_loop_heartbeat`: Envia mensagens de heartbeat para o Teams em horários fixos.
-*   **Varredura de Relés:** A cada 10 minutos, consulta a API PVOperation para dados de relés. Identifica novos alertas e normalizações, atualiza o estado interno e envia notificações para o Teams.
-*   **Varredura de Inversores:** A cada 15 minutos, consulta a API PVOperation para dados de inversores. Detecta falhas (3 leituras consecutivas com Pac=0) e normalizações (3 leituras consecutivas com Pac>0) dentro de uma janela de geração (06:30-17:30). Se houver um relé ativo em uma usina, a varredura do inversor para essa usina é pulada para evitar alertas redundantes.
-*   **Estado e Locks:** O estado do monitor é salvo atomicamente em `monitor_state.json`. Locks (`_state_lock`, `_scan_lock`) são usados para garantir a consistência dos dados entre as threads e durante o salvamento do estado. Um lock de arquivo (`.monitor_lock`) garante que apenas uma instância do monitor esteja ativa.
-*   **Shutdown:** Em caso de interrupção (Ctrl+C ou sinais de sistema), o monitor tenta encerrar suas threads graciosamente, salva o estado final e libera o lock de instância.
+| Arquivo | Uso |
+|---|---|
+| `main.py` | **Produção** — lógica completa e validada |
+| `monitor_daemon.py` | Alternativa simplificada — veja `README_daemon.md` |
 
-## 4. Requisitos
+---
 
-*   **Python:** Versão 3.x
-*   **Bibliotecas Python:**
-    *   `requests`
-    *   `pathlib` (nativo do Python 3.4+)
-    *   `logging` (nativo)
-    *   `threading` (nativo)
-    *   `datetime` (nativo)
-    *   `email.utils` (nativo)
-    *   `socket` (nativo)
-    *   `signal` (nativo)
-    *   `statistics` (nativo)
-    *   `fcntl` (para sistemas Unix-like) ou `msvcrt` (para Windows) para lock de arquivo.
-*   **Sistema Operacional:** Linux (preferencialmente) ou Windows.
+## Monitoramento de Relés
 
-## 5. Instalação
+### Como funciona
 
-1.  **Clone o repositório:**
-    ```bash
-    git clone <URL_DO_REPOSITORIO>
-    cd <DIRETORIO_DO_PROJETO>
-    ```
-2.  **Crie e ative um ambiente virtual (recomendado):**
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate  # No Windows: .\venv\Scripts\activate
-    ```
-3.  **Instale as dependências:**
-    ```bash
-    pip install requests
-    ```
-    *(Nota: `pytest` não é uma dependência de runtime, mas é recomendado para testes.)*
+- Varredura a cada **10 minutos** (`RELAY_INTERVAL = 600`).
+- Para cada usina, consulta `day_relay` no intervalo `[ultima_varredura + 1s, agora]`.
+- Registros são filtrados pelo timestamp `tsleitura` dentro do intervalo.
+- `tem_dados` só é `True` após passar o filtro temporal — dado fora da janela não conta.
+- O checkpoint avança por `max_ts_processado` (timestamp máximo processado), não por `datetime.now()`.
 
-## 6. Configuração
+### Detecção de alerta
 
-As configurações principais estão hardcoded no topo do arquivo `main.py`. **Para ambientes de produção, é altamente recomendado o uso de variáveis de ambiente para credenciais sensíveis.**
+- Parâmetros do relé (`PARAMETROS_RELE`) com valor ativo (`True`, `1`, `"true"`) indicam falha.
+- Alertas são agrupados por `(usina, rele_id, tipo_alerta)` e acumulam todos os parâmetros ativos do intervalo.
+- **Todos os alertas** do intervalo são retornados e processados (não apenas o primeiro).
 
-Edite a seção `CONFIGURACAO` no `main.py`:
+### Classificação
 
-```python
-# =========================
-# CONFIGURACAO (EDITAR AQUI)
-# =========================
-PVOP_BASE_URL = "https://apipv.pvoperation.com.br/api/v1"  # URL base da API PVOperation
-PVOP_EMAIL = "<SEU_EMAIL_PVOPERATION>"                     # Seu email de login na PVOperation
-PVOP_PASSWORD = "<SUA_SENHA_PVOPERATION>"                   # Sua senha da PVOperation
-TEAMS_WEBHOOK_URL = "<SUA_URL_WEBHOOK_TEAMS>"               # URL do Incoming Webhook do Microsoft Teams
-TEAMS_ENABLED = True                                        # Define se as notificações do Teams estão ativas (True/False)
-# =========================
-```
+| Tipo | Parâmetros |
+|---|---|
+| SOBRETENSÃO | r59A, r59B, r59C, r59N |
+| SUBTENSÃO | r27A, r27B, r27C, r27_0 |
+| FREQUÊNCIA | r81O, r81U |
+| TÉRMICO | r49, r49_2 |
+| BLOQUEIO | rAR, rBA, rDO |
+| OUTROS | demais parâmetros |
 
-**Substitua os placeholders (`<SEU_EMAIL_PVOPERATION>`, `<SUA_SENHA_PVOPERATION>`, `<SUA_URL_WEBHOOK_TEAMS>`) pelos valores reais.**
+### Lista parcial de usinas
 
-**Variáveis de Ambiente (Recomendado para Produção):**
-Em vez de editar o `main.py` diretamente, você pode definir as seguintes variáveis de ambiente:
+- Se a API retorna menos usinas que o estado salvo, é detectado como lista parcial.
+- Usinas ausentes em lista parcial **preservam alertas ativos** — sem falsa normalização.
 
-*   `PVOP_BASE_URL`
-*   `PVOP_EMAIL`
-*   `PVOP_PASSWORD`
-*   `TEAMS_WEBHOOK_URL`
-*   `TEAMS_ENABLED` (pode ser `"True"` ou `"False"`)
+### Normalização
 
-O script tentará ler essas variáveis de ambiente primeiro, se existirem.
+- Quando um alerta some da API e não aparece mais no intervalo, ele é normalizado.
+- Notificação de normalização é enviada ao Teams.
 
-## 7. Execução Local
+---
 
-Para executar o monitor localmente:
+## Monitoramento de Inversores
+
+### Como funciona
+
+- Varredura a cada **15 minutos** (`INVERTER_INTERVAL = 900`).
+- Para cada usina, consulta `day_inverter` no intervalo `[ultima_varredura + 1s, agora]`.
+- Registros fora da **janela solar** são ignorados.
+- O checkpoint avança por `max_ts_processado`.
+
+### Janelas solares
+
+| Usina | Início | Fim |
+|---|---|---|
+| Padrão | 06:30 | 17:00 |
+| Ibimirim (`COMP.IBI.2500.*`) | 07:30 | 17:00 |
+
+### Regras de falha
+
+- `PAC <= 0` (incluindo negativos) = leitura de falha.
+- PAC ausente ou não parseável **não conta** como leitura válida — não mascara ausência de dado.
+- **Falha confirmada:** `INVERTER_CONSECUTIVE_READINGS = 3` leituras consecutivas com `PAC <= 0`.
+- Ao confirmar falha, notificação enviada ao Teams.
+
+### Regras de recuperação
+
+- **Recuperação confirmada:** `INVERTER_RECOVERY_CONSECUTIVE_READINGS = 2` leituras consecutivas com `PAC > 0`.
+- Gap temporal entre leituras (> 2× intervalo mediano) reseta os contadores de sequência.
+
+### Carry-across de estado entre janelas
+
+- `seq_zero` e `rec_seq` são persistidos no state e carregados na próxima varredura.
+- A sequência de falha ou recuperação **acumula entre scans**.
+
+### Gentle suppression (inversor ausente)
+
+- Se um inversor some da lista por `INVERTER_MISSING_SCAN_TOLERANCE = 3` scans seguidos:
+  - `ultima_confirmacao_ts` é zerado (sai do heartbeat).
+  - `ativa = True` é preservado — não é normalizado.
+  - Modelo at-least-once: duplicata eventual é preferível ao silêncio.
+
+### Prioridade Relé → Inversor
+
+- Se uma usina tem alerta de relé ativo, a varredura de inversores para essa usina é pulada.
+- Evita alertas redundantes sobre a mesma causa raiz.
+
+### Lista parcial de usinas (inversores)
+
+- Usinas ausentes em lista parcial **não têm estado limpo** — estado de falha é preservado.
+
+---
+
+## Heartbeat
+
+Mensagem enviada ao Teams confirmando que o monitor está ativo.
+
+**Horários fixos:**
+- 07:00, 12:00, 17:00, 20:00, 23:00
+
+---
+
+## Notificações Teams
+
+- Envio via Incoming Webhook.
+- Retry automático em HTTP 429 respeitando o header `Retry-After`.
+- Notificações **não são enviadas dentro de locks** de threading.
+- Modelo at-least-once: falha no envio gera nova tentativa no próximo scan.
+- `notificado=True` não é marcado se o inversor já estiver `ativa=False`.
+
+---
+
+## Persistência de Estado
+
+Arquivo: `state/monitor_state.json`
+
+Campos relevantes:
+
+| Campo | Descrição |
+|---|---|
+| `ultima_varredura_rele_por_usina` | Checkpoint por usina para relés |
+| `ultima_varredura_inversor_por_usina` | Checkpoint por usina para inversores |
+| `rele_alertas_ativos` | Alertas de relé em aberto |
+| `estado_inversores` | Estado de falha/seq por inversor (inclui `seq_zero`, `rec_seq`, `ultima_confirmacao_ts`) |
+| `pending_notifications` | Notificações pendentes de retry |
+| `historico_incidentes` | Incidentes encerrados (até `MAX_INCIDENT_HISTORY = 10000`, retenção 180 dias) |
+
+**Não edite o arquivo manualmente enquanto o monitor estiver rodando.**
+Em caso de corrupção, o monitor faz backup (`.corrupt.TIMESTAMP`) e reinicia com estado limpo.
+
+---
+
+## Relatório Semanal
+
+- Gerado automaticamente às **00:05** de uma data configurada (`WEEKLY_REPORT_GENERATION_TIME`).
+- Verifica pendência a cada `WEEKLY_REPORT_CHECK_INTERVAL = 300` segundos.
+- Exportado como arquivo compactado `.zip` com histórico de incidentes da semana.
+- Log de geração inclui janelas solares ativas: relé, inversor padrão e Ibimirim.
+
+---
+
+## Como rodar localmente
 
 ```bash
-python3 main.py
+python main.py
 ```
 
-Para sair, pressione `Ctrl+C`.
-
-**Testes (se `pytest` estiver instalado):**
-
-```bash
-pytest -q
-```
+Interrompa com `Ctrl+C`. O monitor salva estado e libera o lock antes de encerrar.
 
 **Verificação de sintaxe:**
-
 ```bash
-python3 -m compileall main.py
+python -m py_compile main.py monitor_daemon.py
 ```
 
-## 8. Execução em Servidor
+---
 
-Para execução em um servidor de produção 24/7, é recomendado configurar o monitor como um serviço do sistema (ex: `systemd` no Linux). Isso garante que o monitor inicie automaticamente com o sistema e seja reiniciado em caso de falha.
+## Como rodar os testes
 
-**Exemplo de arquivo `systemd` (ex: `/etc/systemd/system/pvmonitor.service`):**
+```bash
+python -m pytest -q
+```
+
+A suíte cobre 61 casos: fluxos de relé, inversor, heartbeat, retry, gentle suppression, seq_zero carry-across, Teams 429, locking, reconciliação P2/P3/P4 e merge de estado.
+
+**Sem chamadas reais à API ou ao Teams** — todos os testes usam mocks/monkeypatch.
+
+---
+
+## Como validar sem consumir API/Teams real
+
+1. `TEAMS_ENABLED = False` no topo do `main.py` desabilita qualquer envio.
+2. Defina uma URL de webhook inválida — as chamadas falharão silenciosamente (log de warning).
+3. Use os testes existentes (`pytest -q`) para validar lógica sem dependências externas.
+4. Para testar um fluxo manualmente, edite `monitor_state.json` para simular estado anterior.
+
+---
+
+## Deploy como serviço (Linux/systemd)
 
 ```ini
 [Unit]
-Description=PVOperation Monitor Service
+Description=PV Monitor Service
 After=network.target
 
 [Service]
@@ -131,15 +211,11 @@ User=ubuntu
 WorkingDirectory=/opt/pvmonitor
 ExecStart=/opt/pvmonitor/venv/bin/python3 /opt/pvmonitor/main.py
 Restart=always
-Environment="PVOP_EMAIL=seu_email" "PVOP_PASSWORD=sua_senha" "TEAMS_WEBHOOK_URL=sua_webhook_url"
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 ```
-
-**Ajuste `User`, `WorkingDirectory`, `ExecStart` e as variáveis `Environment` conforme seu ambiente.**
-
-Após criar o arquivo de serviço:
 
 ```bash
 sudo systemctl daemon-reload
@@ -148,90 +224,74 @@ sudo systemctl start pvmonitor.service
 sudo systemctl status pvmonitor.service
 ```
 
-## 9. Logs
+**Windows:** use NSSM ou Task Scheduler apontando para `python main.py`.
 
-Os logs são rotacionados diariamente e armazenados nos seguintes diretórios:
+---
 
-*   **Logs Gerais:** `logs/rele/rele.log`
-*   **Logs de Relés:** `logs/rele/rele.log`
-*   **Logs de Inversores:** `logs/inversor/inversor.log`
+## Logs
 
-**Exemplos de logs para procurar:**
+Rotacionados diariamente:
 
-*   `[HEARTBEAT]`: Mensagens de pulsação do monitor.
-*   `[RELE] Falha`: Alertas de falha de relé.
-*   `[RELE] Normalizacao`: Normalização de relé.
-*   `[ALERTA INVERSOR]`: Alertas de falha de inversor.
-*   `[RECUPERACAO INVERSOR]`: Normalização de inversor.
-*   `[PVOP] Falha ao logar`: Problemas de autenticação na API PVOperation.
-*   `[TEAMS] Falha ao enviar webhook`: Problemas no envio de notificações para o Teams.
+| Logger | Arquivo |
+|---|---|
+| Geral | `logs/rele/rele.log` |
+| Inversores | `logs/inversor/inversor.log` |
 
-## 10. State
+Marcadores úteis nos logs:
+- `[HEARTBEAT]` — pulsação do monitor
+- `[RELE] Falha` / `[RELE] Normalizacao`
+- `[ALERTA INVERSOR]` / `[RECUPERACAO INVERSOR]`
+- `[TEAMS] Falha ao enviar webhook`
 
-O estado do monitor é persistido no arquivo `state/monitor_state.json`. Este arquivo armazena informações cruciais para a operação contínua, como:
+---
 
-*   `ultima_varredura_rele`: Timestamp da última varredura geral de relés.
-*   `ultima_varredura_inversor`: Timestamp da última varredura geral de inversores.
-*   `ultima_varredura_rele_por_usina`: Última varredura por usina para relés.
-*   `ultima_varredura_inversor_por_usina`: Última varredura por usina para inversores.
-*   `rele_alertas_ativos`: Conjunto de alertas de relé atualmente ativos.
-*   `estado_inversores`: Estado de falha/normalização dos inversores.
-*   `pending_notifications`: Notificações do Teams que não puderam ser enviadas e estão aguardando retry.
+## Configuração
 
-**Cuidados:**
+Credenciais e webhook estão hardcoded em `main.py` por decisão operacional. Para ambientes onde isso não for aceitável, use variáveis de ambiente com substituição manual ou um sistema de segredos.
 
-*   Não edite este arquivo manualmente enquanto o monitor estiver em execução.
-*   Em caso de corrupção do arquivo, o monitor tentará fazer um backup (`.corrupt.TIMESTAMP`) e iniciará com um estado limpo.
+```python
+PVOP_BASE_URL = "https://apipv.pvoperation.com.br/api/v1"
+PVOP_EMAIL    = "..."
+PVOP_PASSWORD = "..."
+TEAMS_WEBHOOK_URL = "..."
+TEAMS_ENABLED = True
+```
 
-## 11. Regras de Alertas
+SSL: defina `SSL_CERT_FILE` ou `REQUESTS_CA_BUNDLE` para apontar ao bundle de CA do servidor.
 
-### Relés
+---
 
-*   **Detecção:** Baseada em parâmetros específicos (`PARAMETROS_RELE`) que indicam um estado ativo (falha).
-*   **Classificação:** Alertas são classificados em tipos (ex: SOBRETENSÃO, TÉRMICO, BLOQUEIO) com base nos parâmetros ativos.
+## Checklist de Deploy
 
-### Inversores
+- [ ] Dependências instaladas: `pip install requests`
+- [ ] Credenciais corretas em `main.py` ou variáveis de ambiente configuradas no serviço
+- [ ] Diretórios `state/` e `logs/` com permissão de escrita para o usuário do serviço
+- [ ] `VERIFY_CA` aponta para o bundle de CA correto (se aplicável)
+- [ ] Testes passando: `python -m pytest -q`
+- [ ] Sintaxe validada: `python -m py_compile main.py`
+- [ ] Serviço configurado para restart automático
 
-*   **Janela de Operação:** Apenas leituras entre 06:30 e 17:30 são consideradas.
-*   **Falha:** Detectada quando a potência (`Pac`) é igual a 0 em 3 leituras sequenciais.
-*   **Normalização:** Detectada quando a potência (`Pac`) é maior que 0 em 3 leituras sequenciais, após um estado de falha.
+---
 
-### Prioridade Relé → Inversor
+## Estrutura dos principais arquivos
 
-*   Se houver um alerta de relé ativo em uma usina, a varredura de inversores para essa usina é **pulada**. Isso evita alertas redundantes e foca na causa raiz do problema.
+```
+main.py                  — monitor principal (produção)
+monitor_daemon.py        — alternativa simplificada (legado)
+state/monitor_state.json — estado persistido entre execuções
+state/.monitor_lock      — lock de instância única
+logs/rele/rele.log       — logs de relé
+logs/inversor/inversor.log — logs de inversor
+tests/test_main.py       — suíte principal (58 testes)
+tests/test_hardening.py  — testes de endurecimento (3 testes)
+```
 
-## 12. Troubleshooting
+---
 
-*   **Teams 429 (Too Many Requests):** O monitor implementa retry com backoff exponencial e respeita o cabeçalho `Retry-After`. Se o problema persistir, verifique os limites de taxa do Teams para Incoming Webhooks.
-*   **PVOperation Indisponível:** O monitor tentará reautenticar e fazer retry em caso de erros de conexão ou `401 Unauthorized`. Se a API estiver persistentemente indisponível, verifique a conectividade de rede e o status do serviço PVOperation.
-*   **Lock Ativo:** Se o monitor não iniciar com a mensagem "Outra instância rodando", verifique se há um processo `main.py` já ativo ou se o arquivo `state/.monitor_lock` não foi liberado corretamente após um encerramento abrupto. Remova o arquivo `.monitor_lock` manualmente se tiver certeza de que nenhuma outra instância está rodando.
-*   **State Corrompido:** Se o arquivo `state/monitor_state.json` estiver corrompido, o monitor fará um backup (`.corrupt.TIMESTAMP`) e iniciará com um estado limpo. Isso pode levar a reenvio de alertas ativos.
+## Limitações conhecidas
 
-## 13. Segurança
-
-*   **Credenciais Hardcoded:** As credenciais da API PVOperation e a URL do webhook do Teams estão atualmente hardcoded no `main.py`. **É fortemente recomendado migrar essas credenciais para variáveis de ambiente ou um sistema de gerenciamento de segredos (ex: Azure Key Vault, HashiCorp Vault) em ambientes de produção.**
-*   **Rotação de Segredos:** Implemente uma política de rotação regular para as senhas da PVOperation e, se possível, para a URL do webhook do Teams.
-
-## 14. Checklist de Deploy
-
-### Antes do `git push`
-
-*   [ ] **Remover Credenciais Hardcoded:** Certifique-se de que `PVOP_EMAIL`, `PVOP_PASSWORD` e `TEAMS_WEBHOOK_URL` não contenham valores reais no código que será versionado. Use placeholders ou garanta que serão definidos via variáveis de ambiente no servidor.
-*   [ ] **Revisar Configurações:** Verifique se `RELAY_INTERVAL`, `INVERTER_INTERVAL`, `HEARTBEAT_TIMES` e outros parâmetros estão adequados para o ambiente de produção.
-
-### No Servidor
-
-*   [ ] **Instalar Dependências:** Garanta que todas as bibliotecas Python necessárias estejam instaladas no ambiente do servidor.
-*   [ ] **Configurar Variáveis de Ambiente:** Defina as variáveis de ambiente para as credenciais (`PVOP_EMAIL`, `PVOP_PASSWORD`, `TEAMS_WEBHOOK_URL`) e `TEAMS_ENABLED`.
-*   [ ] **Configurar Serviço:** Crie e habilite o serviço `systemd` (ou equivalente) para garantir a execução 24/7 e o reinício automático.
-*   [ ] **Verificar Permissões:** Certifique-se de que o usuário sob o qual o serviço será executado tenha permissões de leitura/escrita nos diretórios `state/` e `logs/`.
-*   [ ] **Configurar SSL:** Verifique se `VERIFY_CA` aponta para o bundle de CA correto no servidor, se aplicável.
-
-### Como Validar Antes do Deploy
-
-*   [ ] **Execução Local com Variáveis de Ambiente:** Teste o monitor localmente definindo as variáveis de ambiente (em vez de hardcoded) para simular o ambiente de produção.
-*   [ ] **Testes de Conectividade:** Verifique se o servidor tem acesso à API PVOperation e ao endpoint do Teams Webhook.
-*   [ ] **Teste de Alerta:** Force um cenário de alerta (se possível em ambiente de homologação) para confirmar que as notificações chegam ao Teams.
-*   [ ] **Teste de Heartbeat:** Verifique se as mensagens de heartbeat são enviadas nos horários configurados.
-*   [ ] **Teste de Reinício:** Inicie o monitor, force um encerramento abrupto (ex: `kill -9 <PID>`) e reinicie para verificar se o estado é recuperado corretamente.
-*   [ ] **Monitoramento de Logs:** Acompanhe os logs iniciais para garantir que não há erros de configuração ou inicialização.
+- Sem detecção de lista parcial para `day_relay` individual (apenas para a lista de usinas).
+- Sem suporte a múltiplos webhooks Teams (apenas um canal configurado).
+- Relatório semanal não inclui dados em tempo real da API no momento da geração — usa histórico do state.
+- Gentle suppression não envia notificação explícita de "inversor sumiu" — apenas deixa de confirmar no heartbeat.
+- `TEAMS_WEBHOOK_URL` hardcoded no repositório — não use este repositório público.

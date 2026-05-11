@@ -83,6 +83,13 @@ IBIMIRIM_INVERTER_PLANT_NAMES = {
     "COMP.IBI.2500.LT04",
     "COMP.IBI.2500.LT05",
 }
+# Apenas estas usinas possuem relé de proteção e devem ser varridas no fluxo de relé.
+RELE_PLANT_IDS = {
+    "19478", "19815", "19816", "21544", "22275", "22283", "22290", "22291",
+    "22873", "22874", "24129", "24130", "53209", "53222", "53297", "59991",
+    "60003", "60559", "297443", "297444", "297445", "297446", "297449",
+    "18744051", "18744052",
+}
 WEEKLY_REPORT_CHECK_INTERVAL = 300
 WEEKLY_REPORT_GENERATION_TIME = dtime(0, 5)
 # Usa uma semana extra para reconstruir estado na borda da semana sem aumentar
@@ -109,7 +116,8 @@ MAX_PENDING_RELE_POR_USINA = 200
 MAX_PENDING_INV = 400
 MAX_INCIDENT_HISTORY = 10000
 INCIDENT_RETENTION_DAYS = 180
-INVERTER_CONSECUTIVE_READINGS = 5
+INVERTER_CONSECUTIVE_READINGS = 3
+INVERTER_RECOVERY_CONSECUTIVE_READINGS = 2
 INVERTER_FAILURE_LABEL = f"PAC=0 ({INVERTER_CONSECUTIVE_READINGS} leituras consecutivas)"
 INVERTER_MISSING_SCAN_TOLERANCE = 3
 INVERTER_HEARTBEAT_CONFIRMATION_TTL = timedelta(seconds=(INVERTER_INTERVAL * 3) + 60)
@@ -710,8 +718,8 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
 
     agrupados = {}
     tem_dados = False
-    tem_resposta = False
     teve_timeout = False
+    max_ts_processado = None
 
     d = inicio.date()
     while d <= fim.date():
@@ -722,12 +730,7 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
             d += timedelta(days=1)
             continue
 
-        if isinstance(data_resp, list):
-            if data_resp:
-                tem_dados = True
-            else:
-                tem_resposta = True
-        else:
+        if not isinstance(data_resp, list):
             logger_rele.warning(f"Resposta inesperada em day_relay (usina {plant_id}): {type(data_resp).__name__}")
             d += timedelta(days=1)
             continue
@@ -752,6 +755,9 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
                 continue
             if not (inicio <= ts <= fim):
                 continue
+            tem_dados = True
+            if max_ts_processado is None or ts > max_ts_processado:
+                max_ts_processado = ts
 
             ativos = [p for p in PARAMETROS_RELE if _valor_ativo(conteudo.get(p))]
             if not ativos:
@@ -783,7 +789,7 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
         d += timedelta(days=1)
 
     if not agrupados:
-        return [], tem_dados, teve_timeout
+        return [], tem_dados, teve_timeout, max_ts_processado
 
     candidatos = []
     for entry in agrupados.values():
@@ -791,10 +797,10 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
         entry["parametros"] = ", ".join(sorted(entry.pop("parametros_set")))
         candidatos.append(entry)
     candidatos.sort(key=lambda a: a["ts_leitura"])
-    return candidatos, tem_dados, teve_timeout
+    return candidatos, tem_dados, teve_timeout, max_ts_processado
 
 
-# Avalia leituras de inversores para identificar falha (Pac 0) e recuperacao (Pac > 0).
+# Avalia leituras de inversores para identificar falha (Pac 0) e recuperacao (Pac != 0).
 def detectar_falhas_inversores(
     api: PVOperationAPI,
     plant_id: str,
@@ -811,6 +817,7 @@ def detectar_falhas_inversores(
     tem_dados = False
     tem_resposta = False
     teve_timeout = False
+    max_ts_processado = None
 
     d = inicio.date()
     while d <= fim.date():
@@ -865,9 +872,11 @@ def detectar_falhas_inversores(
                 leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "cond_ok": False, "sem_dados": True, "pac": None})
                 continue
 
-            cond = pac == 0.0
+            cond = pac <= 0
             leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "cond_ok": cond, "sem_dados": False, "pac": pac})
             tem_dados = True
+            if max_ts_processado is None or ts > max_ts_processado:
+                max_ts_processado = ts
         d += timedelta(days=1)
 
     falhas = []
@@ -923,7 +932,7 @@ def detectar_falhas_inversores(
                         "inversor_id": str(inv_id),
                         "ts_leitura": ts,
                         "status": "FALHA",
-                        "indicadores": {"pac": 0.0},
+                        "indicadores": {"pac": item.get("pac", 0.0)},
                     }
                 )
                 ativa = True
@@ -933,7 +942,7 @@ def detectar_falhas_inversores(
             if ativa and pac_zero:
                 ultima_confirmacao_dt = ts
 
-            if ativa and rec_seq >= INVERTER_CONSECUTIVE_READINGS:
+            if ativa and rec_seq >= INVERTER_RECOVERY_CONSECUTIVE_READINGS:
                 recuperados.append(
                     {
                         "inversor_id": str(inv_id),
@@ -951,6 +960,7 @@ def detectar_falhas_inversores(
             "rec_seq": rec_seq,
             "seq_zero": seq_zero,
             "ultima_confirmacao_ts": ultima_confirmacao_dt.isoformat() if ultima_confirmacao_dt else None,
+            "tem_dado_valido": any(not item.get("sem_dados") for item in lst),
         }
 
     def _intervalo_atinge_janela(inicio_dt: datetime, fim_dt: datetime) -> bool:
@@ -968,7 +978,17 @@ def detectar_falhas_inversores(
     # Fora da janela de geração, lista vazia não deve bloquear avanço de janela
     dentro_janela = _intervalo_atinge_janela(inicio, fim)
     tem_dados_efetivo = tem_dados or (tem_resposta and not dentro_janela)
-    return falhas, recuperados, tem_dados_efetivo, falhas_ativas, teve_timeout
+    return falhas, recuperados, tem_dados_efetivo, falhas_ativas, teve_timeout, max_ts_processado
+
+
+def _plant_ids_retornados(plantas):
+    ids = set()
+    for p in plantas or []:
+        try:
+            ids.add(str(int(p.get("id"))))
+        except (TypeError, ValueError):
+            continue
+    return ids
 
 
 # Servico central que orquestra varreduras de reles/inversores e envia notificacoes.
@@ -1221,7 +1241,7 @@ class MonitorService:
         finalizado["fim_ts"] = fim_dt.isoformat()
         self.historico_incidentes.append(finalizado)
 
-    def _reconciliar_inversores_ausentes(self, usina_id: str, chaves_observadas, referencia_ts: datetime):
+    def _reconciliar_inversores_ausentes(self, usina_id: str, chaves_observadas):
         if not usina_id:
             return
         observadas = {str(chave) for chave in (chaves_observadas or []) if chave}
@@ -1247,25 +1267,13 @@ class MonitorService:
                 self.estado_inversores[chave_inv] = estado
                 continue
 
-            alerta_prev = estado.get("alerta")
-            logger_inv.warning(
-                f"Inversor {chave_inv} ausente em {ausente_scans} varreduras validas; limpando alerta ativo preso."
-            )
-            estado["ativa"] = False
-            estado["rec_seq"] = 0
-            estado["seq_zero"] = 0
-            estado["alerta"] = None
-            estado["notificado"] = False
-            estado["ausente_scans"] = 0
-            estado["ultima_confirmacao_ts"] = None
+            if estado.get("ultima_confirmacao_ts") is not None:
+                logger_inv.warning(
+                    f"Inversor {chave_inv} ausente em {ausente_scans} varreduras validas; suprimindo do heartbeat."
+                )
+                estado["ultima_confirmacao_ts"] = None
+            estado["ausente_scans"] = ausente_scans
             self.estado_inversores[chave_inv] = estado
-            self.pending_notifications.get("inv_normalizados", {}).pop(chave_inv, None)
-            self._registrar_fim_incidente_inversor(
-                chave_inv=chave_inv,
-                fim_ts=referencia_ts,
-                alerta_prev=alerta_prev,
-                usina_id=usina_id,
-            )
 
     # Carrega estado de ultima varredura e listas de alertas persistidos em disco.
     def _load_state(self):
@@ -1460,6 +1468,18 @@ class MonitorService:
                         entry["ultima_confirmacao_ts"] = entry.get("ultima_confirmacao_ts")
                         self.estado_inversores[estado_key] = entry
 
+            for chave, estado in self.estado_inversores.items():
+                if (
+                    estado.get("ativa")
+                    and _parse_iso_datetime(estado.get("ultima_confirmacao_ts")) is None
+                    and int(estado.get("ausente_scans", 0)) < INVERTER_MISSING_SCAN_TOLERANCE
+                ):
+                    usina_id = chave.split(":", 1)[0] if ":" in chave else None
+                    if usina_id:
+                        varredura_dt = self.ultima_varredura_inversor_por_usina.get(str(usina_id))
+                        if varredura_dt:
+                            estado["ultima_confirmacao_ts"] = varredura_dt.isoformat()
+
             for base in list(self.rele_alertas_ativos):
                 if base in self.incidentes_rele_ativos:
                     continue
@@ -1570,25 +1590,6 @@ class MonitorService:
             espera = max(1, (proximo - datetime.now()).total_seconds())
             if self.stop_event.wait(espera):
                 break
-
-    def _loop_rele(self):  # pragma: no cover
-        """LEGACY/DEPRECATED: use _loop_scans; mantido por compatibilidade."""
-        while not self.stop_event.is_set():
-            try:
-                self.executar_varredura_rele()
-            except Exception:
-                logger.exception("Erro na varredura de relé")
-            self.stop_event.wait(RELAY_INTERVAL)
-
-    # Loop continuo que dispara varredura de inversores no intervalo definido.
-    def _loop_inversor(self):  # pragma: no cover
-        """LEGACY/DEPRECATED: use _loop_scans; mantido por compatibilidade."""
-        while not self.stop_event.is_set():
-            try:
-                self.executar_varredura_inversor()
-            except Exception:
-                logger_inv.exception("Erro na varredura de inversor")
-            self.stop_event.wait(INVERTER_INTERVAL)
 
     # Loop de heartbeat para enviar notificacao em horarios fixos.
     def _loop_heartbeat(self):
@@ -1747,7 +1748,7 @@ class MonitorService:
         inicio_busca = inicio_semana - timedelta(days=WEEKLY_REPORT_WARMUP_DAYS)
         fim_busca = fim_semana - timedelta(seconds=1)
         janela_inicio, janela_fim = _obter_janela_solar_inversor(usina_nome)
-        falhas, recuperados, _, _, _ = detectar_falhas_inversores(
+        falhas, recuperados, _, _, _, _ = detectar_falhas_inversores(
             self.api_inversor,
             usina_id,
             inicio_busca,
@@ -2084,24 +2085,28 @@ class MonitorService:
             if not pendente:
                 return False
             inicio_semana, fim_semana, report_id = pendente
-            incidentes_api = self._coletar_incidentes_semana_api(inicio_semana, fim_semana)
             incidentes_state = self._coletar_incidentes_semana_state(inicio_semana, fim_semana)
 
-            if incidentes_api is None:
-                incidentes_finais = self._mesclar_incidentes_relatorio(incidentes_state, fim_semana)
-                logger.warning(
-                    "Relatorio semanal usando apenas state local (coleta direta da API indisponivel)."
-                )
-            else:
-                incidentes_finais = self._mesclar_incidentes_relatorio(
-                    list(incidentes_api) + list(incidentes_state), fim_semana
-                )
-                logger.info(
-                    "[RELATORIO] Incidentes semanais consolidados | API: %s | State: %s | Final: %s",
-                    len(incidentes_api),
-                    len(incidentes_state),
-                    len(incidentes_finais),
-                )
+        # Coleta da API fora do lock para não bloquear scans e heartbeat.
+        _t0_rel_api = time.monotonic()
+        incidentes_api = self._coletar_incidentes_semana_api(inicio_semana, fim_semana)
+        logger.info("[RELATORIO] Coleta API semanal concluida em %.1fs", time.monotonic() - _t0_rel_api)
+
+        if incidentes_api is None:
+            incidentes_finais = self._mesclar_incidentes_relatorio(incidentes_state, fim_semana)
+            logger.warning(
+                "Relatorio semanal usando apenas state local (coleta direta da API indisponivel)."
+            )
+        else:
+            incidentes_finais = self._mesclar_incidentes_relatorio(
+                list(incidentes_api) + list(incidentes_state), fim_semana
+            )
+            logger.info(
+                "[RELATORIO] Incidentes semanais consolidados | API: %s | State: %s | Final: %s",
+                len(incidentes_api),
+                len(incidentes_state),
+                len(incidentes_finais),
+            )
 
         resumo_rows, ocorrencias_rows, semana_txt = self._montar_relatorio_semanal(
             inicio_semana, fim_semana, incidentes_finais, {}, {}
@@ -2123,13 +2128,15 @@ class MonitorService:
             self._save_state()
         logger.info(
             f"Relatorio semanal gerado: {arquivo} | Janela solar rele: {SOLAR_WINDOW_LABEL} | "
-            f"Janela solar inversor: {INVERTER_SOLAR_WINDOW_LABEL} | Semana: {semana_txt}"
+            f"Janela solar inversor: {INVERTER_SOLAR_WINDOW_LABEL} | "
+            f"Janela solar inversor (Ibimirim): {IBIMIRIM_INVERTER_SOLAR_WINDOW_LABEL} | Semana: {semana_txt}"
         )
         return True
 
     # Busca alertas de rele nas usinas e dispara notificacoes unicas por evento.
     def executar_varredura_rele(self):
         with self._scan_lock:
+            _t0_scan_rele = time.monotonic()
             agora = datetime.now()
             # começa no último fim de varredura + delta; primeira vez vai até 00:00
             if self.ultima_varredura_rele:
@@ -2139,14 +2146,10 @@ class MonitorService:
             logger_rele.info("Varredura de rele iniciada.")
             sem_plantas = False
             pend_norm = self.pending_notifications.setdefault("rele_normalizados", {})
-            teve_erro_api = False
-            teve_timeout_api = False
 
             plantas = self.api_rele.get_plants()
             if plantas is None:
-                teve_erro_api = True
-                teve_timeout_api = bool(self.api_rele.last_get_plants_timeout)
-                motivo = "TIMEOUT" if teve_timeout_api else "ERRO_API"
+                motivo = "TIMEOUT" if self.api_rele.last_get_plants_timeout else "ERRO_API"
                 logger_rele.warning(
                     f"Erro ao buscar plantas (rele). Motivo: {motivo}. Mantendo alertas ativos."
                 )
@@ -2161,10 +2164,20 @@ class MonitorService:
                 sem_plantas = True
                 plantas = []
 
+            ausentes_rele = set()
+            if plantas:
+                ids_retornados = _plant_ids_retornados(plantas)
+                usinas_esperadas_rele = set(self.ultima_varredura_rele_por_usina) | {
+                    base.split(":", 1)[0] for base in self.rele_alertas_ativos
+                }
+                ausentes_rele = usinas_esperadas_rele - ids_retornados
+                if ausentes_rele:
+                    logger_rele.warning(f"Lista parcial de usinas (rele); ausentes: {sorted(ausentes_rele)}")
+
             bases_ativos_atual = set()
             novos_por_usina = {}
             resolvidos_por_usina = {}
-            usinas_sem_dados = set()
+            usinas_sem_dados = set(ausentes_rele)
 
             for p in plantas:
                 usina_id_raw = p.get("id")
@@ -2174,6 +2187,8 @@ class MonitorService:
                     logger_rele.warning(f"Usina com id inválido (rele): {usina_id_raw!r}. Pulando.")
                     continue
                 usina_id = str(usina_id_int)
+                if usina_id not in RELE_PLANT_IDS:
+                    continue
                 nome = p.get("nome")
                 cap = p.get("capacidade")
 
@@ -2183,7 +2198,7 @@ class MonitorService:
                 else:
                     inicio_janela = inicio_padrao
 
-                alertas, tem_dados, teve_timeout = detectar_alertas_rele(self.api_rele, usina_id, inicio_janela, agora)
+                alertas, tem_dados, teve_timeout, max_ts_rele = detectar_alertas_rele(self.api_rele, usina_id, inicio_janela, agora)
                 if not tem_dados:
                     motivo = "TIMEOUT" if teve_timeout else "SEM_DADOS"
                     logger_rele.warning(f"Sem dados de relé em {nome} (motivo: {motivo}). Mantendo alertas ativos.")
@@ -2248,8 +2263,8 @@ class MonitorService:
                     )
                     novos_por_usina.setdefault(usina_id, {"usina": nome, "capacidade": cap, "itens": []})["itens"].append(alerta_fmt)
 
-                if not teve_timeout:
-                    self.ultima_varredura_rele_por_usina[usina_id] = agora
+                if max_ts_rele is not None:
+                    self.ultima_varredura_rele_por_usina[usina_id] = max_ts_rele
 
             if usinas_sem_dados:
                 for base in self.rele_alertas_ativos:
@@ -2294,6 +2309,7 @@ class MonitorService:
                     saida.append(item)
                 return saida
 
+            notification_jobs = []
             usinas = set(novos_por_usina.keys()) | set(resolvidos_por_usina.keys()) | set(pend_norm.keys())
             for usina_id in usinas:
                 pacote = {"usina": None, "capacidade": None, "novos": [], "normalizados": []}
@@ -2327,13 +2343,38 @@ class MonitorService:
                 if not pacote["novos"] and not pacote["normalizados"]:
                     continue
 
-                ok_novos, ok_norm = self._notificar_rele_agrupado(pacote)
-                if pacote["novos"] and ok_novos:
-                    for item in pacote["novos"]:
-                        base = item.get("base")
-                        if base:
-                            self.rele_notificados.add(base)
                 if pacote["normalizados"]:
+                    pend_list = pend_norm.setdefault(usina_id, [])
+                    existentes = {i.get("base") for i in pend_list if i.get("base")}
+                    for item in pacote["normalizados"]:
+                        base = item.get("base")
+                        if base and base in existentes:
+                            continue
+                        pend_list.append(item)
+                        if base:
+                            existentes.add(base)
+                notification_jobs.append((usina_id, pacote))
+
+            if not sem_plantas:
+                self.ultima_varredura_rele = agora
+            self._save_state()
+            lock_api_duration = time.monotonic() - _t0_scan_rele
+        # Lock released — send Teams outside the lock
+
+        job_results = {}
+        for usina_id, pacote in notification_jobs:
+            ok_novos, ok_norm = self._notificar_rele_agrupado(pacote)
+            job_results[usina_id] = (ok_novos, ok_norm, pacote)
+
+        if job_results:
+            with self._scan_lock:
+                pend_norm = self.pending_notifications.setdefault("rele_normalizados", {})
+                for usina_id, (ok_novos, ok_norm, pacote) in job_results.items():
+                    if ok_novos:
+                        for item in pacote["novos"]:
+                            base = item.get("base")
+                            if base:
+                                self.rele_notificados.add(base)
                     if ok_norm:
                         bases_norm = {item.get("base") for item in pacote["normalizados"] if item.get("base")}
                         if bases_norm and usina_id in pend_norm:
@@ -2342,26 +2383,15 @@ class MonitorService:
                             ]
                             if not pend_norm[usina_id]:
                                 pend_norm.pop(usina_id, None)
-                    else:
-                        pend_list = pend_norm.setdefault(usina_id, [])
-                        existentes = {i.get("base") for i in pend_list if i.get("base")}
-                        for item in pacote["normalizados"]:
-                            base = item.get("base")
-                            if base and base in existentes:
-                                continue
-                            pend_list.append(item)
-                            if base:
-                                existentes.add(base)
+                self._save_state()
 
-            if not sem_plantas:
-                self.ultima_varredura_rele = agora
-            # salva estado ao fim da varredura para evitar retrabalho após quedas
-            self._save_state()
-            logger_rele.info("Varredura de rele concluida.")
+        logger_rele.info("[SCAN] Varredura rele fase lock/API concluida em %.1fs", lock_api_duration)
+        logger_rele.info("Varredura de rele concluida.")
 
     # Analisa inversores e alerta se houver falha persistente ou recuperacao.
     def executar_varredura_inversor(self):
         with self._scan_lock:
+            _t0_scan_inv = time.monotonic()
             agora = datetime.now()
             if self.ultima_varredura_inversor:
                 inicio_padrao = self.ultima_varredura_inversor + timedelta(seconds=WINDOW_DELTA_SECONDS)
@@ -2370,29 +2400,12 @@ class MonitorService:
             logger_inv.info("Varredura de inversor iniciada.")
             sem_plantas = False
             pend_norm = self.pending_notifications.setdefault("inv_normalizados", {})
-            teve_erro_api = False
-            teve_timeout_api = False
 
-            def _reenviar_normalizacoes_pendentes():
-                if not pend_norm:
-                    return
-                for chave, payload in list(pend_norm.items()):
-                    usina_id = chave.split(":", 1)[0] if ":" in chave else None
-                    if usina_id and usina_id in self.usinas_alerta_rele_recente:
-                        continue
-                    alerta = payload.get("alerta") if isinstance(payload, dict) else None
-                    alerta_prev = payload.get("alerta_prev") if isinstance(payload, dict) else None
-                    if not isinstance(alerta, dict):
-                        pend_norm.pop(chave, None)
-                        continue
-                    if self._notificar_inversor_recuperado(alerta, alerta_prev):
-                        pend_norm.pop(chave, None)
+            notification_inv_jobs = []
 
             plantas = self.api_inversor.get_plants()
             if plantas is None:
-                teve_erro_api = True
-                teve_timeout_api = bool(self.api_inversor.last_get_plants_timeout)
-                motivo = "TIMEOUT" if teve_timeout_api else "ERRO_API"
+                motivo = "TIMEOUT" if self.api_inversor.last_get_plants_timeout else "ERRO_API"
                 logger_inv.warning(f"Erro ao buscar plantas (inversor). Motivo: {motivo}.")
                 sem_plantas = True
                 plantas = []
@@ -2400,6 +2413,15 @@ class MonitorService:
                 logger_inv.warning("Nenhuma usina encontrada (inversor).")
                 sem_plantas = True
                 plantas = []
+
+            if plantas:
+                ids_retornados_inv = _plant_ids_retornados(plantas)
+                usinas_esperadas_inv = set(self.ultima_varredura_inversor_por_usina) | {
+                    chave.split(":", 1)[0] for chave in self.estado_inversores
+                }
+                ausentes_inv = usinas_esperadas_inv - ids_retornados_inv
+                if ausentes_inv:
+                    logger_inv.warning(f"Lista parcial de usinas (inversor); ausentes: {sorted(ausentes_inv)}")
 
             for p in plantas:
                 usina_id_raw = p.get("id")
@@ -2425,7 +2447,7 @@ class MonitorService:
                 else:
                     inicio_janela = inicio_padrao
 
-                falhas, recuperados, tem_dados_inv, falhas_ativas_atual, teve_timeout = detectar_falhas_inversores(
+                falhas, recuperados, tem_dados_inv, falhas_ativas_atual, teve_timeout, max_ts_inv = detectar_falhas_inversores(
                     self.api_inversor,
                     usina_id,
                     inicio_janela,
@@ -2446,7 +2468,14 @@ class MonitorService:
                 for falha in falhas:
                     eventos.append(("falha", falha["ts_leitura"], falha))
                 eventos.sort(key=lambda item: item[1])
-                chaves_observadas = set(falhas_ativas_atual.keys())
+                chaves_observadas = {
+                    chave for chave, estado in falhas_ativas_atual.items()
+                    if isinstance(estado, dict) and estado.get("tem_dado_valido")
+                }
+                chaves_vistas = {
+                    chave for chave, estado in falhas_ativas_atual.items()
+                    if isinstance(estado, dict)
+                }
 
                 tentativas_envio = set()
 
@@ -2465,11 +2494,8 @@ class MonitorService:
                             "indicadores": item.get("indicadores", {}),
                             "janela_solar_label": janela_label_inv,
                         }
-                        enviado = self._notificar_inversor_recuperado(alerta, alerta_prev)
-                        if enviado:
-                            pend_norm.pop(chave_inv, None)
-                        else:
-                            pend_norm[chave_inv] = {"alerta": alerta, "alerta_prev": alerta_prev}
+                        pend_norm[chave_inv] = {"alerta": alerta, "alerta_prev": alerta_prev}
+                        notification_inv_jobs.append({"tipo": "rec", "chave": chave_inv, "alerta": alerta, "alerta_prev": alerta_prev})
                         if chave_inv in self.estado_inversores:
                             self.estado_inversores[chave_inv]["alerta"] = None
                             self.estado_inversores[chave_inv]["notificado"] = False
@@ -2506,16 +2532,14 @@ class MonitorService:
                             inicio_ts=item["ts_leitura"],
                         )
                         if not entry.get("notificado", False):
-                            enviado = self._notificar_inversor(alerta)
-                            entry["notificado"] = bool(enviado)
+                            notification_inv_jobs.append({"tipo": "falha", "chave": chave_inv, "alerta": alerta})
                             tentativas_envio.add(chave_inv)
                         self.estado_inversores[chave_inv] = entry
 
-                if chaves_observadas:
+                if chaves_vistas:
                     self._reconciliar_inversores_ausentes(
                         usina_id=usina_id,
                         chaves_observadas=chaves_observadas,
-                        referencia_ts=agora,
                     )
 
                 if not tem_dados_inv:
@@ -2534,9 +2558,7 @@ class MonitorService:
                     alerta = estado.get("alerta")
                     if not isinstance(alerta, dict):
                         continue
-                    if self._notificar_inversor(alerta):
-                        estado["notificado"] = True
-                        self.estado_inversores[chave_inv] = estado
+                    notification_inv_jobs.append({"tipo": "falha_resend", "chave": chave_inv, "alerta": alerta})
 
                 for chave_inv, estado in falhas_ativas_atual.items():
                     if isinstance(estado, bool):
@@ -2544,14 +2566,22 @@ class MonitorService:
                     if not isinstance(estado, dict):
                         continue
                     prev_entry = self.estado_inversores.get(chave_inv, {})
+                    tem_dado_valido = chave_inv in chaves_observadas
                     entry = {
                         "ativa": bool(estado.get("ativa", False)),
                         "rec_seq": int(estado.get("rec_seq", 0)),
                         "seq_zero": int(estado.get("seq_zero", 0)),
                         "alerta": prev_entry.get("alerta"),
                         "notificado": bool(prev_entry.get("notificado", False)),
-                        "ausente_scans": 0,
-                        "ultima_confirmacao_ts": estado.get("ultima_confirmacao_ts") or prev_entry.get("ultima_confirmacao_ts"),
+                        "ausente_scans": (
+                            0 if tem_dado_valido
+                            else int(prev_entry.get("ausente_scans", 0))
+                        ),
+                        "ultima_confirmacao_ts": (
+                            estado.get("ultima_confirmacao_ts")
+                            if tem_dado_valido
+                            else prev_entry.get("ultima_confirmacao_ts")
+                        ),
                     }
                     if not entry["ativa"]:
                         entry["alerta"] = None
@@ -2559,15 +2589,54 @@ class MonitorService:
                         entry["ultima_confirmacao_ts"] = None
                     self.estado_inversores[chave_inv] = entry
 
-                if tem_dados_inv:
-                    self.ultima_varredura_inversor_por_usina[usina_id] = agora
+                if max_ts_inv is not None:
+                    self.ultima_varredura_inversor_por_usina[usina_id] = max_ts_inv
 
-            _reenviar_normalizacoes_pendentes()
+            already_rec = {j["chave"] for j in notification_inv_jobs if j["tipo"] == "rec"}
+            for chave, payload in list(pend_norm.items()):
+                if chave in already_rec:
+                    continue
+                uid = chave.split(":", 1)[0] if ":" in chave else None
+                if uid and uid in self.usinas_alerta_rele_recente:
+                    continue
+                alerta = payload.get("alerta") if isinstance(payload, dict) else None
+                alerta_prev = payload.get("alerta_prev") if isinstance(payload, dict) else None
+                if not isinstance(alerta, dict):
+                    pend_norm.pop(chave, None)
+                    continue
+                notification_inv_jobs.append({"tipo": "rec_retry", "chave": chave, "alerta": alerta, "alerta_prev": alerta_prev})
+
             if not sem_plantas:
                 self.ultima_varredura_inversor = agora
-            # salva estado ao fim da varredura para evitar retrabalho após quedas
             self._save_state()
-            logger.info("Varredura de inversor concluída.")
+            lock_api_duration = time.monotonic() - _t0_scan_inv
+        # Lock released — send Teams outside the lock
+
+        inv_results = {}
+        for job in notification_inv_jobs:
+            tipo = job["tipo"]
+            chave = job["chave"]
+            if tipo in ("rec", "rec_retry"):
+                ok = self._notificar_inversor_recuperado(job["alerta"], job.get("alerta_prev"))
+            else:
+                ok = self._notificar_inversor(job["alerta"])
+            inv_results.setdefault(chave, {})[tipo] = ok
+
+        if inv_results:
+            with self._scan_lock:
+                pend_norm = self.pending_notifications.setdefault("inv_normalizados", {})
+                for chave, resultados in inv_results.items():
+                    if resultados.get("rec") or resultados.get("rec_retry"):
+                        pend_norm.pop(chave, None)
+                    if resultados.get("falha") or resultados.get("falha_resend"):
+                        estado = self.estado_inversores.get(chave)
+                        if isinstance(estado, dict) and estado.get("ativa"):
+                            estado["notificado"] = True
+                            self.estado_inversores[chave] = estado
+                self._save_state()
+
+        logger_inv.info("[SCAN] Varredura inversor fase lock/API concluida em %.1fs", lock_api_duration)
+        logger.info("Varredura de inversor concluída.")
 
     # Formata intervalo de tempo das leituras para texto amigavel.
     @staticmethod
@@ -2604,7 +2673,9 @@ class MonitorService:
     # Envia notificacao de heartbeat/saude em horarios fixos.
     def _enviar_heartbeat(self, previsto: datetime):
         referencia_hb = previsto if isinstance(previsto, datetime) else datetime.now()
+        _wait_t0 = time.monotonic()
         with self._scan_lock:
+            lock_wait = time.monotonic() - _wait_t0
             rele_alertas = list(self.rele_alertas_ativos)
             rele_alerta_chave = dict(self.rele_alerta_chave)
             estado_inversores = dict(self.estado_inversores)
@@ -2614,6 +2685,7 @@ class MonitorService:
             )
             ultima_rele = self.ultima_varredura_rele
             ultima_inv = self.ultima_varredura_inversor
+        logger.info("[HEARTBEAT] Aguardou %.2fs pelo scan_lock", lock_wait)
 
         rele_usinas = []
         if ativos_rele:
@@ -2782,7 +2854,7 @@ class MonitorService:
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             return _teams_post_card(
-                title=f"✔️ Normalização de Inversor (Pac=0; {INVERTER_CONSECUTIVE_READINGS} leituras; {janela_label})",
+                title=f"✔️ Normalização de Inversor (Pac normalizado; {INVERTER_RECOVERY_CONSECUTIVE_READINGS} leituras; {janela_label})",
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
                     f"**Inversor:** {alerta['inversor']}  \n"
