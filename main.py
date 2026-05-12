@@ -211,6 +211,7 @@ def validate_config():
             "Edite a secao CONFIGURACAO no topo do main.py."
         )
 
+
 def _parse_retry_after_seconds(headers: dict) -> "int | None":
     """Parsa o header Retry-After e retorna o numero de segundos a esperar."""
     retry_after = (headers or {}).get("Retry-After")
