@@ -27,6 +27,7 @@ import socket
 import signal
 from statistics import median
 from collections import defaultdict
+from functools import lru_cache
 from zipfile import ZipFile, ZIP_DEFLATED
 
 # =========================
@@ -53,6 +54,8 @@ except ImportError:
 # --- Configuração geral ---
 RELAY_INTERVAL = 600          # 10 min
 INVERTER_INTERVAL = 900       # 15 min
+PLANTS_CACHE_TTL = timedelta(seconds=RELAY_INTERVAL)  # relay e inversor partilham a mesma lista
+SAVE_STATE_FAIL_THRESHOLD = 3
 STOP_JOIN_TIMEOUT = 35        # aguarda encerramento das threads antes de forcar saida
 HEARTBEAT_TIMES = [
     dtime(7, 0),
@@ -122,11 +125,10 @@ INVERTER_FAILURE_LABEL = f"PAC=0 ({INVERTER_CONSECUTIVE_READINGS} leituras conse
 INVERTER_MISSING_SCAN_TOLERANCE = 3
 INVERTER_HEARTBEAT_CONFIRMATION_TTL = timedelta(seconds=(INVERTER_INTERVAL * 3) + 60)
 
-# alias para compatibilidade interna
-BASE_URL = PVOP_BASE_URL
-
 # SSL: ajuste para o bundle correto no servidor (ex.: /etc/ssl/certs/ca.pem)
 VERIFY_CA = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or True
+
+_teams_session = requests.Session()
 
 # Diretórios/arquivos de controle
 BASE_DIR = Path(__file__).resolve().parent
@@ -145,6 +147,22 @@ WINDOW_DELTA_SECONDS = 1
 STATE_SCHEMA_VERSION = 1
 
 
+def _configurar_logger_arquivo(name: str, log_dir: Path, log_filename: str, fmt, base_logger) -> logging.Logger:
+    lgr = logging.getLogger(name)
+    lgr.setLevel(logging.INFO)
+    lgr.handlers.clear()
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        h = TimedRotatingFileHandler(log_dir / log_filename, when="midnight", backupCount=7, encoding="utf-8")
+        h.setLevel(logging.INFO)
+        h.setFormatter(fmt)
+        lgr.addHandler(h)
+    except Exception as e:
+        base_logger.warning(f"Falha ao inicializar log em arquivo ({name}): {e}")
+    lgr.propagate = True
+    return lgr
+
+
 # Responsavel por criar os loggers base e setar a rotacao diaria dos arquivos de log.
 def setup_logging():
     fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -157,31 +175,8 @@ def setup_logging():
     console.setFormatter(fmt)
     base_logger.addHandler(console)
 
-    logger_rele = logging.getLogger("RelayMonitorHeadless.rele")
-    logger_rele.setLevel(logging.INFO)
-    logger_rele.handlers.clear()
-    try:
-        LOG_RELE_DIR.mkdir(parents=True, exist_ok=True)
-        LOG_INV_DIR.mkdir(parents=True, exist_ok=True)
-        h_rele = TimedRotatingFileHandler(LOG_RELE_DIR / "rele.log", when="midnight", backupCount=7, encoding="utf-8")
-        h_rele.setLevel(logging.INFO)
-        h_rele.setFormatter(fmt)
-        logger_rele.addHandler(h_rele)
-    except Exception as e:
-        base_logger.warning(f"Falha ao inicializar log de rele em arquivo: {e}")
-    logger_rele.propagate = True
-
-    logger_inv = logging.getLogger("RelayMonitorHeadless.inversor")
-    logger_inv.setLevel(logging.INFO)
-    logger_inv.handlers.clear()
-    try:
-        h_inv = TimedRotatingFileHandler(LOG_INV_DIR / "inversor.log", when="midnight", backupCount=7, encoding="utf-8")
-        h_inv.setLevel(logging.INFO)
-        h_inv.setFormatter(fmt)
-        logger_inv.addHandler(h_inv)
-    except Exception as e:
-        base_logger.warning(f"Falha ao inicializar log de inversor em arquivo: {e}")
-    logger_inv.propagate = True
+    _configurar_logger_arquivo("RelayMonitorHeadless.rele",     LOG_RELE_DIR, "rele.log",     fmt, base_logger)
+    _configurar_logger_arquivo("RelayMonitorHeadless.inversor", LOG_INV_DIR,  "inversor.log", fmt, base_logger)
 
 
 # Inicializa configuracao de loggers antes de criar instancias globais.
@@ -216,28 +211,31 @@ def validate_config():
             "Edite a secao CONFIGURACAO no topo do main.py."
         )
 
+def _parse_retry_after_seconds(headers: dict) -> "int | None":
+    """Parsa o header Retry-After e retorna o numero de segundos a esperar."""
+    retry_after = (headers or {}).get("Retry-After")
+    if not retry_after:
+        return None
+    try:
+        return max(0, int(retry_after))
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = parsedate_to_datetime(retry_after)
+    except Exception:
+        return None
+    if not parsed:
+        return None
+    now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+    delta = (parsed - now).total_seconds()
+    return max(0, int(delta))
+
+
 # Envia cartao padrao (MessageCard) para Teams quando alertas ocorrem.
 def _teams_post_card(title, text, severity="info", facts=None):
     """Envia um 'MessageCard' para um Incoming Webhook do Microsoft Teams."""
     if not TEAMS_ENABLED:
         return False
-    def _retry_after_seconds(resp):
-        retry_after = resp.headers.get("Retry-After")
-        if not retry_after:
-            return None
-        try:
-            return max(0, int(retry_after))
-        except (TypeError, ValueError):
-            pass
-        try:
-            parsed = parsedate_to_datetime(retry_after)
-        except Exception:
-            return None
-        if not parsed:
-            return None
-        now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
-        delta = (parsed - now).total_seconds()
-        return max(0, int(delta))
 
     colors = {"info": "0078D4", "warning": "FFA000", "danger": "D13438"}
     payload = {
@@ -254,14 +252,14 @@ def _teams_post_card(title, text, severity="info", facts=None):
     backoff_base = 2
     for tentativa in range(1, max_tentativas + 1):
         try:
-            r = requests.post(
+            r = _teams_session.post(
                 TEAMS_WEBHOOK_URL,
                 data=json.dumps(payload),
                 headers={"Content-Type": "application/json"},
                 timeout=10,
             )
             if r.status_code == 429:
-                espera = _retry_after_seconds(r)
+                espera = _parse_retry_after_seconds(r.headers)
                 if espera is not None:
                     espera = min(max(0, espera), 60)
                     if tentativa == max_tentativas:
@@ -284,7 +282,7 @@ class PVOperationAPI:
     """Cliente da API PVOperation com retry e verificação SSL configurável."""
 
     # Inicializa credenciais, sessao HTTP e dispara autenticacao inicial.
-    def __init__(self, email, password, base_url=BASE_URL, verify=VERIFY_CA):
+    def __init__(self, email, password, base_url=PVOP_BASE_URL, verify=VERIFY_CA):
         self.email = email
         self.password = password
         self.base_url = base_url
@@ -304,24 +302,6 @@ class PVOperationAPI:
             pass
         self.session = Session()
         self.session.verify = self._verify
-
-    def _retry_after_seconds(self, response):
-        retry_after = response.headers.get("Retry-After")
-        if not retry_after:
-            return None
-        try:
-            return max(0, int(retry_after))
-        except (TypeError, ValueError):
-            pass
-        try:
-            parsed = parsedate_to_datetime(retry_after)
-        except Exception:
-            return None
-        if not parsed:
-            return None
-        now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
-        delta = (parsed - now).total_seconds()
-        return max(0, int(delta))
 
     def _request_with_retry(
         self,
@@ -396,7 +376,7 @@ class PVOperationAPI:
                 if tentativa == max_tentativas:
                     return resp, False
                 if resp.status_code == 429:
-                    espera = self._retry_after_seconds(resp)
+                    espera = _parse_retry_after_seconds(resp.headers)
                     if espera is None:
                         espera = min(backoff_base ** tentativa, 10)
                 else:
@@ -465,7 +445,12 @@ class PVOperationAPI:
             self.last_get_plants_error = True
             return None
         if r.status_code == 200:
-            return r.json() or []
+            try:
+                return r.json() or []
+            except Exception:
+                logger.error("Resposta não-JSON em get_plants (status 200).")
+                self.last_get_plants_error = True
+                return None
         logger.error(f"Erro ao buscar plantas. Status: {r.status_code}")
         self.last_get_plants_error = True
         return None
@@ -526,6 +511,7 @@ def _xml_escape(txt: str) -> str:
     )
 
 
+@lru_cache(maxsize=128)
 def _xlsx_col_name(index_zero_based: int) -> str:
     idx = int(index_zero_based)
     if idx < 0:
@@ -657,6 +643,93 @@ def _formatar_janela_solar_label(janela_inicio: dtime, janela_fim: dtime) -> str
     return f"{janela_inicio.strftime('%H:%M')}-{janela_fim.strftime('%H:%M')}"
 
 
+def _formatar_blocos_rele(itens: list) -> str:
+    blocos = []
+    for it in itens:
+        blocos.append(
+            "  \n".join([
+                f"Relé: {it.get('rele', 'N/A')}",
+                f"Tipo: {it.get('tipo', 'N/A')}",
+                f"Horário: {it.get('horario', '?')}",
+                f"Parâmetros: {it.get('parametros', '')}",
+            ])
+        )
+    return "  \n  \n".join(blocos)
+
+
+def _montar_card_rele_falha(pacote: dict) -> "dict | None":
+    novos = pacote.get("novos") or []
+    if not novos:
+        return None
+    texto = _formatar_blocos_rele(novos)
+    usina = pacote.get("usina", "N/A")
+    severos = {"SOBRETENSÃO", "TÉRMICO", "BLOQUEIO"}
+    severity = "danger" if any(i.get("tipo") in severos for i in novos) else "warning"
+    return {
+        "title": f"⚠️ Falha de relé - {usina}",
+        "text": f"  \n{texto}",
+        "severity": severity,
+        "facts": [("Capacidade", f"{pacote.get('capacidade', 'N/A')} kWp")],
+    }
+
+
+def _montar_card_rele_normalizacao(pacote: dict) -> "dict | None":
+    normalizados = pacote.get("normalizados") or []
+    if not normalizados:
+        return None
+    texto = _formatar_blocos_rele(normalizados)
+    usina = pacote.get("usina", "N/A")
+    return {
+        "title": f"✔️ Normalização de relé - {usina}",
+        "text": f"  \n{texto}",
+        "severity": "info",
+        "facts": [("Capacidade", f"{pacote.get('capacidade', 'N/A')} kWp")],
+    }
+
+
+def _formatar_corpo_card_inversor(alerta: dict, detalhes_txt: str) -> str:
+    return (
+        f"**Usina:** {alerta['usina']}  \n"
+        f"**Inversor:** {alerta['inversor']}  \n"
+        f"**Horário:** {alerta['horario']}  \n"
+        f"**Detalhes:** {detalhes_txt}"
+    )
+
+
+def _formatar_texto_heartbeat(
+    *,
+    rele_atrasado: bool,
+    inv_atrasado: bool,
+    ultima_rele,
+    ultima_inv,
+    ativos_rele: int,
+    ativos_inv: int,
+    rele_usinas: list,
+    inv_usina_counts: dict,
+    previsto,
+) -> str:
+    bullet_prefix = "    • "
+    info = [
+        "Heartbeat: monitor rodando",
+        "Status: OK" if not (rele_atrasado or inv_atrasado) else "Status: SCAN ATRASADO",
+        *(["⚠️ Scan de relé atrasado"] if rele_atrasado else []),
+        *(["⚠️ Scan de inversor atrasado"] if inv_atrasado else []),
+        f"Última varredura relé: {ultima_rele.strftime('%d/%m %H:%M:%S') if ultima_rele else 'N/D'}",
+        f"Última varredura inversor: {ultima_inv.strftime('%d/%m %H:%M:%S') if ultima_inv else 'N/D'}",
+        f"Host/PID: {socket.gethostname()} / {os.getpid()}",
+        f"Heartbeat previsto: {previsto.strftime('%d/%m %H:%M')}",
+        "",
+        f"**Alertas de relé ativos: {ativos_rele}**",
+    ]
+    for nome in rele_usinas:
+        info.append(f"{bullet_prefix}{nome}")
+    info.append("")
+    info.append(f"**Alertas de inversor ativos: {ativos_inv}**")
+    for nome in sorted(inv_usina_counts):
+        info.append(f"{bullet_prefix}{nome} ({inv_usina_counts[nome]})")
+    return "  \n".join(info)
+
+
 def _is_ibimirim_usina(usina_nome: str) -> bool:
     if not usina_nome:
         return False
@@ -696,26 +769,24 @@ def _calcular_sobreposicao_janela_solar(
     return total
 
 
+def _rele_param_ativo(valor) -> bool:
+    if isinstance(valor, bool):
+        return valor
+    if isinstance(valor, (int, float)):
+        return valor == 1
+    if isinstance(valor, str):
+        txt = valor.strip().lower()
+        if txt in {"true", "1"}:
+            return True
+        try:
+            return float(txt) == 1.0
+        except Exception:
+            return False
+    return False
+
+
 # Varre leituras de rele no intervalo informado para encontrar eventos e classifica-los.
 def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, fim: datetime):
-    def _valor_ativo(valor):
-        if isinstance(valor, bool):
-            return valor
-        if isinstance(valor, (int, float)):
-            return valor == 1
-        if isinstance(valor, str):
-            txt = valor.strip().lower()
-            if txt in {"true", "1"}:
-                return True
-            try:
-                return float(txt) == 1.0
-            except Exception:
-                return False
-        return False
-
-    PARAMS_CLASSIF = RELAY_PARAMS_CLASSIF
-    PARAMETROS_RELE = RELAY_PARAMETROS
-
     agrupados = {}
     tem_dados = False
     teve_timeout = False
@@ -745,12 +816,11 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
                     f"conteudojson invalido em day_relay (usina {plant_id}): {type(conteudo_raw).__name__}"
                 )
                 continue
-            conteudo = conteudo_raw
             idrele = registro.get("idrele")
             if not idrele:
                 continue
             try:
-                ts = datetime.strptime(conteudo.get("tsleitura", ""), "%Y-%m-%d %H:%M:%S")
+                ts = datetime.strptime(conteudo_raw.get("tsleitura", ""), "%Y-%m-%d %H:%M:%S")
             except Exception:
                 continue
             if not (inicio <= ts <= fim):
@@ -759,12 +829,12 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
             if max_ts_processado is None or ts > max_ts_processado:
                 max_ts_processado = ts
 
-            ativos = [p for p in PARAMETROS_RELE if _valor_ativo(conteudo.get(p))]
+            ativos = [p for p in conteudo_raw if p in RELAY_PARAMETROS and _rele_param_ativo(conteudo_raw[p])]
             if not ativos:
                 continue
 
             tipo = "OUTROS"
-            for classe, lista in PARAMS_CLASSIF.items():
+            for classe, lista in RELAY_PARAMS_CLASSIF.items():
                 if any(p in lista for p in ativos):
                     tipo = classe
                     break
@@ -843,13 +913,12 @@ def detectar_falhas_inversores(
                     f"conteudojson invalido em day_inverter (usina {plant_id}): {type(conteudo_raw).__name__}"
                 )
                 continue
-            conteudo = conteudo_raw
-            inv_id = reg.get("idinversor") or conteudo.get("Inversor") or conteudo.get("esn")
+            inv_id = reg.get("idinversor") or conteudo_raw.get("Inversor") or conteudo_raw.get("esn")
             if not inv_id:
                 continue
             inv_id = str(inv_id)
             try:
-                ts = datetime.strptime(conteudo.get("tsleitura", ""), "%Y-%m-%d %H:%M:%S")
+                ts = datetime.strptime(conteudo_raw.get("tsleitura", ""), "%Y-%m-%d %H:%M:%S")
             except Exception:
                 continue
             if not (inicio <= ts <= fim):
@@ -859,8 +928,8 @@ def detectar_falhas_inversores(
 
             pac_raw = None
             for k in ("Pac", "PAC", "Potencia_Saida", "Pout", "Potencia"):
-                if k in conteudo:
-                    pac_raw = conteudo.get(k)
+                if k in conteudo_raw:
+                    pac_raw = conteudo_raw.get(k)
                     break
 
             if pac_raw is None:
@@ -1010,6 +1079,9 @@ class MonitorService:
         self.incidentes_inv_ativos = {}       # usina:inv -> incidente aberto
         self.historico_incidentes = []        # incidentes concluídos (relé e inversor)
         self.last_weekly_report_id = None
+        self._last_historico_cleanup = None   # throttle: evita varredura completa a cada save
+        self._plants_cache = None             # cache da lista de usinas entre relay e inversor scan
+        self._plants_cache_ts = None
 
     # Prepara estado inicial do servico e caches de alertas.
     def __init__(self, api_rele: PVOperationAPI, api_inversor: PVOperationAPI = None):
@@ -1021,6 +1093,7 @@ class MonitorService:
         self._state_lock = threading.Lock()
         self._threads = []
         self._scan_lock = threading.Lock()
+        self._save_state_fail_count = 0
 
     # Inicia o monitor em modo daemon criando threads de varredura.
     def start(self):
@@ -1123,6 +1196,78 @@ class MonitorService:
             logger.warning(f"Falha ao criar backup do state corrompido: {e}")
             return None
 
+    def _detectar_lista_parcial(self, plantas: list, checkpoint_dict: dict, chaves_estado, logger_ctx, contexto: str) -> set:
+        ids_retornados = _plant_ids_retornados(plantas)
+        usinas_esperadas = set(checkpoint_dict) | {chave.split(":", 1)[0] for chave in chaves_estado}
+        ausentes = usinas_esperadas - ids_retornados
+        if ausentes:
+            logger_ctx.warning(f"Lista parcial de usinas ({contexto}); ausentes: {sorted(ausentes)}")
+        return ausentes
+
+    def _obter_plantas(self, api, logger_ctx, contexto: str) -> tuple:
+        agora = datetime.now()
+        if (
+            self._plants_cache is not None
+            and self._plants_cache_ts is not None
+            and (agora - self._plants_cache_ts) < PLANTS_CACHE_TTL
+        ):
+            plantas = self._plants_cache
+        else:
+            plantas = api.get_plants()
+            if plantas is not None:  # None = erro → não cachear
+                self._plants_cache = list(plantas)
+                self._plants_cache_ts = agora
+        if plantas is None:
+            motivo = "TIMEOUT" if api.last_get_plants_timeout else "ERRO_API"
+            logger_ctx.warning(f"Erro ao buscar plantas ({contexto}). Motivo: {motivo}.")
+            return [], True
+        if not plantas:
+            logger_ctx.warning(f"Nenhuma usina encontrada ({contexto}).")
+            return [], True
+        return list(plantas), False
+
+    def _fechar_incidente(self, incidente: dict, fim_ts: datetime):
+        inicio_dt = _parse_iso_datetime(incidente.get("inicio_ts")) or fim_ts
+        fim_dt    = fim_ts if isinstance(fim_ts, datetime) else datetime.now()
+        if fim_dt < inicio_dt:
+            fim_dt = inicio_dt
+        finalizado = dict(incidente)
+        finalizado["fim_ts"] = fim_dt.isoformat()
+        self.historico_incidentes.append(finalizado)
+
+    @staticmethod
+    def _carregar_incidentes_ativos(raw, natureza_default: str, tipo_falha_default: str) -> dict:
+        if not isinstance(raw, dict):
+            return {}
+        resultado = {}
+        for chave, item in raw.items():
+            if not isinstance(item, dict) or not item.get("inicio_ts"):
+                continue
+            resultado[str(chave)] = {
+                "chave":       str(item.get("chave",       chave)),
+                "natureza":    str(item.get("natureza",    natureza_default)),
+                "tipo_falha":  str(item.get("tipo_falha",  tipo_falha_default)),
+                "usina_id":    str(item.get("usina_id",    "")),
+                "usina":       item.get("usina"),
+                "equipamento": str(item.get("equipamento", "")),
+                "inicio_ts":   str(item.get("inicio_ts")),
+            }
+        return resultado
+
+    @staticmethod
+    def _carregar_varredura_por_usina(raw) -> dict:
+        if not isinstance(raw, dict):
+            return {}
+        resultado = {}
+        for usina_id, ts in raw.items():
+            if not ts:
+                continue
+            try:
+                resultado[str(usina_id)] = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+        return resultado
+
     def _limitar_pendencias(self):
         pend_rele = self.pending_notifications.get("rele_normalizados", {})
         if isinstance(pend_rele, dict):
@@ -1140,9 +1285,18 @@ class MonitorService:
         if not isinstance(self.historico_incidentes, list):
             self.historico_incidentes = []
             return
+        # Truncamento de tamanho: sempre aplicado
         if len(self.historico_incidentes) > MAX_INCIDENT_HISTORY:
             self.historico_incidentes = self.historico_incidentes[-MAX_INCIDENT_HISTORY:]
-        limite = datetime.now() - timedelta(days=INCIDENT_RETENTION_DAYS)
+        # Limpeza por data: throttled para 1×/hora (custo linear com 10k itens)
+        agora = datetime.now()
+        if (
+            self._last_historico_cleanup is not None
+            and (agora - self._last_historico_cleanup) < timedelta(hours=1)
+        ):
+            return
+        self._last_historico_cleanup = agora
+        limite = agora - timedelta(days=INCIDENT_RETENTION_DAYS)
         saida = []
         for item in self.historico_incidentes:
             if not isinstance(item, dict):
@@ -1154,7 +1308,7 @@ class MonitorService:
         self.historico_incidentes = saida[-MAX_INCIDENT_HISTORY:]
 
     @staticmethod
-    def _novo_incidente(base_key: str, natureza: str, tipo_falha: str, usina_id: str, usina: str, equipamento: str, inicio_ts: datetime):
+    def _novo_incidente(base_key: str, natureza: str, tipo_falha: str, usina_id: str, usina: str, equipamento: str, inicio_ts: datetime, fim_ts=None):
         inicio = inicio_ts if isinstance(inicio_ts, datetime) else datetime.now()
         return {
             "chave": str(base_key),
@@ -1164,6 +1318,7 @@ class MonitorService:
             "usina": usina or f"Usina {usina_id}",
             "equipamento": str(equipamento),
             "inicio_ts": inicio.isoformat(),
+            "fim_ts": fim_ts,
         }
 
     def _registrar_inicio_incidente_rele(self, base: str, usina_id: str, usina: str, rele_id: str, tipo_falha: str, inicio_ts: datetime):
@@ -1197,13 +1352,7 @@ class MonitorService:
                 equipamento=alerta.get("rele", rele_id),
                 inicio_ts=inicio_dt,
             )
-        inicio_dt = _parse_iso_datetime(incidente.get("inicio_ts")) or fim_ts
-        fim_dt = fim_ts if isinstance(fim_ts, datetime) else datetime.now()
-        if fim_dt < inicio_dt:
-            fim_dt = inicio_dt
-        finalizado = dict(incidente)
-        finalizado["fim_ts"] = fim_dt.isoformat()
-        self.historico_incidentes.append(finalizado)
+        self._fechar_incidente(incidente, fim_ts)
 
     def _registrar_inicio_incidente_inversor(self, chave_inv: str, usina_id: str, usina: str, inversor_id: str, inicio_ts: datetime):
         if chave_inv not in self.incidentes_inv_ativos:
@@ -1233,13 +1382,7 @@ class MonitorService:
                 equipamento=alerta.get("inversor", fallback_inv),
                 inicio_ts=inicio_dt,
             )
-        inicio_dt = _parse_iso_datetime(incidente.get("inicio_ts")) or fim_ts
-        fim_dt = fim_ts if isinstance(fim_ts, datetime) else datetime.now()
-        if fim_dt < inicio_dt:
-            fim_dt = inicio_dt
-        finalizado = dict(incidente)
-        finalizado["fim_ts"] = fim_dt.isoformat()
-        self.historico_incidentes.append(finalizado)
+        self._fechar_incidente(incidente, fim_ts)
 
     def _reconciliar_inversores_ausentes(self, usina_id: str, chaves_observadas):
         if not usina_id:
@@ -1302,26 +1445,12 @@ class MonitorService:
                 datetime.fromisoformat(data.get("ultima_varredura_inversor"))
                 if data.get("ultima_varredura_inversor") else None
             )
-            self.ultima_varredura_rele_por_usina = {}
-            raw_rele_por_usina = data.get("ultima_varredura_rele_por_usina", {})
-            if isinstance(raw_rele_por_usina, dict):
-                for usina_id, ts in raw_rele_por_usina.items():
-                    if not ts:
-                        continue
-                    try:
-                        self.ultima_varredura_rele_por_usina[str(usina_id)] = datetime.fromisoformat(ts)
-                    except Exception:
-                        continue
-            self.ultima_varredura_inversor_por_usina = {}
-            raw_inv_por_usina = data.get("ultima_varredura_inversor_por_usina", {})
-            if isinstance(raw_inv_por_usina, dict):
-                for usina_id, ts in raw_inv_por_usina.items():
-                    if not ts:
-                        continue
-                    try:
-                        self.ultima_varredura_inversor_por_usina[str(usina_id)] = datetime.fromisoformat(ts)
-                    except Exception:
-                        continue
+            self.ultima_varredura_rele_por_usina = self._carregar_varredura_por_usina(
+                data.get("ultima_varredura_rele_por_usina", {})
+            )
+            self.ultima_varredura_inversor_por_usina = self._carregar_varredura_por_usina(
+                data.get("ultima_varredura_inversor_por_usina", {})
+            )
             self.rele_alertas_ativos = set(data.get("rele_alertas_ativos", []))
             self.rele_notificados = set(data.get("rele_notificados", []))
             self.rele_alerta_chave = data.get("rele_alerta_chave", {})
@@ -1366,41 +1495,12 @@ class MonitorService:
                         }
                     )
 
-            self.incidentes_rele_ativos = {}
-            raw_inc_rele = data.get("incidentes_rele_ativos", {})
-            if isinstance(raw_inc_rele, dict):
-                for base, item in raw_inc_rele.items():
-                    if not isinstance(item, dict):
-                        continue
-                    if not item.get("inicio_ts"):
-                        continue
-                    self.incidentes_rele_ativos[str(base)] = {
-                        "chave": str(item.get("chave", base)),
-                        "natureza": str(item.get("natureza", "RELE")),
-                        "tipo_falha": str(item.get("tipo_falha", "")),
-                        "usina_id": str(item.get("usina_id", "")),
-                        "usina": item.get("usina"),
-                        "equipamento": str(item.get("equipamento", "")),
-                        "inicio_ts": str(item.get("inicio_ts")),
-                    }
-
-            self.incidentes_inv_ativos = {}
-            raw_inc_inv = data.get("incidentes_inv_ativos", {})
-            if isinstance(raw_inc_inv, dict):
-                for chave, item in raw_inc_inv.items():
-                    if not isinstance(item, dict):
-                        continue
-                    if not item.get("inicio_ts"):
-                        continue
-                    self.incidentes_inv_ativos[str(chave)] = {
-                        "chave": str(item.get("chave", chave)),
-                        "natureza": str(item.get("natureza", "INVERSOR")),
-                        "tipo_falha": str(item.get("tipo_falha", INVERTER_FAILURE_LABEL)),
-                        "usina_id": str(item.get("usina_id", "")),
-                        "usina": item.get("usina"),
-                        "equipamento": str(item.get("equipamento", "")),
-                        "inicio_ts": str(item.get("inicio_ts")),
-                    }
+            self.incidentes_rele_ativos = self._carregar_incidentes_ativos(
+                data.get("incidentes_rele_ativos", {}), "RELE", ""
+            )
+            self.incidentes_inv_ativos = self._carregar_incidentes_ativos(
+                data.get("incidentes_inv_ativos", {}), "INVERSOR", INVERTER_FAILURE_LABEL
+            )
 
             def _legacy_key_to_estado(chave: str) -> str:
                 if not isinstance(chave, str):
@@ -1531,6 +1631,7 @@ class MonitorService:
             self._init_state_defaults()
             self._save_state()
         except Exception as e:
+            self._init_state_defaults()
             logger.warning(f"Não foi possível carregar estado salvo: {e}")
 
     # Salva em disco o ponto de controle atual das varreduras e alertas ativos.
@@ -1562,8 +1663,20 @@ class MonitorService:
             with self._state_lock:
                 tmp_path.write_text(json.dumps(payload), encoding="utf-8")
                 os.replace(tmp_path, STATE_FILE)
+            self._save_state_fail_count = 0
         except Exception as e:
+            self._save_state_fail_count += 1
             logger.warning(f"Falha ao salvar estado: {e}")
+            if self._save_state_fail_count == SAVE_STATE_FAIL_THRESHOLD:
+                _teams_post_card(
+                    title="Monitor: falha ao salvar estado",
+                    text=(
+                        f"Estado não persistido por {self._save_state_fail_count} "
+                        f"tentativas consecutivas. Verifique disco/permissões. Erro: {e}"
+                    ),
+                    severity="danger",
+                    facts=None,
+                )
 
     # Loop central que coordena varreduras de relé e inversor em ordem determinística.
     def _loop_scans(self):
@@ -1635,26 +1748,10 @@ class MonitorService:
             return valor.strftime("%d/%m/%Y %H:%M:%S")
         return ""
 
-    @staticmethod
-    def _valor_rele_ativo_relatorio(valor):
-        if isinstance(valor, bool):
-            return valor
-        if isinstance(valor, (int, float)):
-            return valor == 1
-        if isinstance(valor, str):
-            txt = valor.strip().lower()
-            if txt in {"true", "1"}:
-                return True
-            try:
-                return float(txt) == 1.0
-            except Exception:
-                return False
-        return False
-
     def _classificar_rele_conteudo_relatorio(self, conteudo):
         if not isinstance(conteudo, dict):
             return None
-        ativos = [p for p in RELAY_PARAMETROS if self._valor_rele_ativo_relatorio(conteudo.get(p))]
+        ativos = [p for p in conteudo if p in RELAY_PARAMETROS and _rele_param_ativo(conteudo[p])]
         if not ativos:
             return None
         tipo = "OUTROS"
@@ -1714,34 +1811,30 @@ class MonitorService:
                     continue
                 if tipo_atual == tipo_ativo:
                     continue
-                incidentes.append(
-                    {
-                        "chave": f"{usina_id}:{rele_id}:{tipo_ativo}",
-                        "natureza": "RELE",
-                        "tipo_falha": tipo_ativo,
-                        "usina_id": str(usina_id),
-                        "usina": usina_nome or f"Usina {usina_id}",
-                        "equipamento": str(rele_id),
-                        "inicio_ts": (inicio_ativo or ts).isoformat(),
-                        "fim_ts": ts.isoformat(),
-                    }
-                )
+                incidentes.append(self._novo_incidente(
+                    base_key=f"{usina_id}:{rele_id}:{tipo_ativo}",
+                    natureza="RELE",
+                    tipo_falha=tipo_ativo,
+                    usina_id=usina_id,
+                    usina=usina_nome,
+                    equipamento=str(rele_id),
+                    inicio_ts=(inicio_ativo or ts),
+                    fim_ts=ts.isoformat(),
+                ))
                 tipo_ativo = tipo_atual
                 inicio_ativo = ts if tipo_atual else None
 
             if tipo_ativo:
-                incidentes.append(
-                    {
-                        "chave": f"{usina_id}:{rele_id}:{tipo_ativo}",
-                        "natureza": "RELE",
-                        "tipo_falha": tipo_ativo,
-                        "usina_id": str(usina_id),
-                        "usina": usina_nome or f"Usina {usina_id}",
-                        "equipamento": str(rele_id),
-                        "inicio_ts": (inicio_ativo or inicio_semana).isoformat(),
-                        "fim_ts": None,
-                    }
-                )
+                incidentes.append(self._novo_incidente(
+                    base_key=f"{usina_id}:{rele_id}:{tipo_ativo}",
+                    natureza="RELE",
+                    tipo_falha=tipo_ativo,
+                    usina_id=usina_id,
+                    usina=usina_nome,
+                    equipamento=str(rele_id),
+                    inicio_ts=(inicio_ativo or inicio_semana),
+                    fim_ts=None,
+                ))
         return incidentes
 
     def _coletar_incidentes_inversor_semana_api(self, usina_id: str, usina_nome: str, inicio_semana: datetime, fim_semana: datetime):
@@ -1778,33 +1871,29 @@ class MonitorService:
             inicio_inc = ativos.pop(chave, inicio_semana)
             if ts < inicio_inc:
                 inicio_inc = ts
-            incidentes.append(
-                {
-                    "chave": chave,
-                    "natureza": "INVERSOR",
-                    "tipo_falha": INVERTER_FAILURE_LABEL,
-                    "usina_id": str(usina_id),
-                    "usina": usina_nome or f"Usina {usina_id}",
-                    "equipamento": inv_id,
-                    "inicio_ts": inicio_inc.isoformat(),
-                    "fim_ts": ts.isoformat(),
-                }
-            )
+            incidentes.append(self._novo_incidente(
+                base_key=chave,
+                natureza="INVERSOR",
+                tipo_falha=INVERTER_FAILURE_LABEL,
+                usina_id=usina_id,
+                usina=usina_nome,
+                equipamento=inv_id,
+                inicio_ts=inicio_inc,
+                fim_ts=ts.isoformat(),
+            ))
 
         for chave, inicio_inc in ativos.items():
             inv_id = chave.split(":", 1)[1] if ":" in chave else chave
-            incidentes.append(
-                {
-                    "chave": chave,
-                    "natureza": "INVERSOR",
-                    "tipo_falha": INVERTER_FAILURE_LABEL,
-                    "usina_id": str(usina_id),
-                    "usina": usina_nome or f"Usina {usina_id}",
-                    "equipamento": inv_id,
-                    "inicio_ts": inicio_inc.isoformat(),
-                    "fim_ts": None,
-                }
-            )
+            incidentes.append(self._novo_incidente(
+                base_key=chave,
+                natureza="INVERSOR",
+                tipo_falha=INVERTER_FAILURE_LABEL,
+                usina_id=usina_id,
+                usina=usina_nome,
+                equipamento=inv_id,
+                inicio_ts=inicio_inc,
+                fim_ts=None,
+            ))
         return incidentes
 
     def _coletar_incidentes_semana_api(self, inicio_semana: datetime, fim_semana: datetime):
@@ -2113,13 +2202,23 @@ class MonitorService:
         )
         fim_legivel = (fim_semana - timedelta(days=1)).strftime("%Y%m%d")
         arquivo = REPORT_DIR / f"relatorio_semanal_{inicio_semana.strftime('%Y%m%d')}_{fim_legivel}.xlsx"
-        _write_xlsx_file(
-            arquivo,
-            [
-                ("Resumo", resumo_rows),
-                ("Ocorrencias", ocorrencias_rows),
-            ],
-        )
+        try:
+            _write_xlsx_file(
+                arquivo,
+                [
+                    ("Resumo", resumo_rows),
+                    ("Ocorrencias", ocorrencias_rows),
+                ],
+            )
+        except Exception as e:
+            logger.error(f"[RELATORIO] Falha ao escrever arquivo xlsx: {e}")
+            _teams_post_card(
+                title="Monitor: falha ao gerar relatório semanal",
+                text=f"Erro ao escrever arquivo: {e}",
+                severity="warning",
+                facts=[("Arquivo", str(arquivo))],
+            )
+            return False
 
         with self._scan_lock:
             if self.last_weekly_report_id == report_id:
@@ -2144,35 +2243,18 @@ class MonitorService:
             else:
                 inicio_padrao = datetime.combine(agora.date(), datetime.min.time())
             logger_rele.info("Varredura de rele iniciada.")
-            sem_plantas = False
             pend_norm = self.pending_notifications.setdefault("rele_normalizados", {})
 
-            plantas = self.api_rele.get_plants()
-            if plantas is None:
-                motivo = "TIMEOUT" if self.api_rele.last_get_plants_timeout else "ERRO_API"
-                logger_rele.warning(
-                    f"Erro ao buscar plantas (rele). Motivo: {motivo}. Mantendo alertas ativos."
-                )
-                # mantem/recalcula bloqueios a partir dos alertas ativos conhecidos
+            plantas, sem_plantas = self._obter_plantas(self.api_rele, logger_rele, "rele")
+            if sem_plantas:
+                logger_rele.info("Mantendo alertas ativos.")
                 self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
-                sem_plantas = True
-                plantas = []
-            elif not plantas:
-                logger_rele.warning("Nenhuma usina encontrada (rele).")
-                # mantem/recalcula bloqueios a partir dos alertas ativos conhecidos
-                self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
-                sem_plantas = True
-                plantas = []
 
             ausentes_rele = set()
             if plantas:
-                ids_retornados = _plant_ids_retornados(plantas)
-                usinas_esperadas_rele = set(self.ultima_varredura_rele_por_usina) | {
-                    base.split(":", 1)[0] for base in self.rele_alertas_ativos
-                }
-                ausentes_rele = usinas_esperadas_rele - ids_retornados
-                if ausentes_rele:
-                    logger_rele.warning(f"Lista parcial de usinas (rele); ausentes: {sorted(ausentes_rele)}")
+                ausentes_rele = self._detectar_lista_parcial(
+                    plantas, self.ultima_varredura_rele_por_usina, self.rele_alertas_ativos, logger_rele, "rele"
+                )
 
             bases_ativos_atual = set()
             novos_por_usina = {}
@@ -2398,30 +2480,16 @@ class MonitorService:
             else:
                 inicio_padrao = datetime.combine(agora.date(), datetime.min.time())
             logger_inv.info("Varredura de inversor iniciada.")
-            sem_plantas = False
             pend_norm = self.pending_notifications.setdefault("inv_normalizados", {})
 
             notification_inv_jobs = []
 
-            plantas = self.api_inversor.get_plants()
-            if plantas is None:
-                motivo = "TIMEOUT" if self.api_inversor.last_get_plants_timeout else "ERRO_API"
-                logger_inv.warning(f"Erro ao buscar plantas (inversor). Motivo: {motivo}.")
-                sem_plantas = True
-                plantas = []
-            elif not plantas:
-                logger_inv.warning("Nenhuma usina encontrada (inversor).")
-                sem_plantas = True
-                plantas = []
+            plantas, sem_plantas = self._obter_plantas(self.api_inversor, logger_inv, "inversor")
 
             if plantas:
-                ids_retornados_inv = _plant_ids_retornados(plantas)
-                usinas_esperadas_inv = set(self.ultima_varredura_inversor_por_usina) | {
-                    chave.split(":", 1)[0] for chave in self.estado_inversores
-                }
-                ausentes_inv = usinas_esperadas_inv - ids_retornados_inv
-                if ausentes_inv:
-                    logger_inv.warning(f"Lista parcial de usinas (inversor); ausentes: {sorted(ausentes_inv)}")
+                self._detectar_lista_parcial(
+                    plantas, self.ultima_varredura_inversor_por_usina, self.estado_inversores, logger_inv, "inversor"
+                )
 
             for p in plantas:
                 usina_id_raw = p.get("id")
@@ -2687,6 +2755,16 @@ class MonitorService:
             ultima_inv = self.ultima_varredura_inversor
         logger.info("[HEARTBEAT] Aguardou %.2fs pelo scan_lock", lock_wait)
 
+        agora_hb = datetime.now()
+        rele_atrasado = (
+            ultima_rele is not None
+            and (agora_hb - ultima_rele).total_seconds() > 2 * RELAY_INTERVAL
+        )
+        inv_atrasado = (
+            ultima_inv is not None
+            and (agora_hb - ultima_inv).total_seconds() > 2 * INVERTER_INTERVAL
+        )
+
         rele_usinas = []
         if ativos_rele:
             for base in rele_alertas:
@@ -2711,26 +2789,17 @@ class MonitorService:
                     continue
                 inv_usina_counts[nome] = inv_usina_counts.get(nome, 0) + 1
 
-        info = [
-            "Heartbeat: monitor rodando",
-            "Status: OK",
-            f"Última varredura relé: {ultima_rele.strftime('%d/%m %H:%M:%S') if ultima_rele else 'N/D'}",
-            f"Última varredura inversor: {ultima_inv.strftime('%d/%m %H:%M:%S') if ultima_inv else 'N/D'}",
-            f"Host/PID: {socket.gethostname()} / {os.getpid()}",
-            f"Heartbeat previsto: {previsto.strftime('%d/%m %H:%M')}",
-            "",
-            f"**Alertas de relé ativos: {ativos_rele}**",
-        ]
-        bullet_prefix = "    • "
-        if rele_usinas:
-            for nome in rele_usinas:
-                info.append(f"{bullet_prefix}{nome}")
-        info.append("")
-        info.append(f"**Alertas de inversor ativos: {ativos_inv}**")
-        if inv_usina_counts:
-            for nome in sorted(inv_usina_counts):
-                info.append(f"{bullet_prefix}{nome} ({inv_usina_counts[nome]})")
-        texto = "  \n".join(info)
+        texto = _formatar_texto_heartbeat(
+            rele_atrasado=rele_atrasado,
+            inv_atrasado=inv_atrasado,
+            ultima_rele=ultima_rele,
+            ultima_inv=ultima_inv,
+            ativos_rele=ativos_rele,
+            ativos_inv=ativos_inv,
+            rele_usinas=rele_usinas,
+            inv_usina_counts=inv_usina_counts,
+            previsto=previsto,
+        )
         logger.info(f"[HEARTBEAT] {texto.replace('  \n', ' | ')}")
         try:
             _teams_post_card(
@@ -2749,69 +2818,42 @@ class MonitorService:
         if not novos and not normalizados:
             return True, True
 
-        def _formatar_blocos(itens):
-            blocos = []
-            for it in itens:
-                blocos.append(
-                    "  \n".join(
-                        [
-                            f"Relé: {it.get('rele','N/A')}",
-                            f"Tipo: {it.get('tipo','N/A')}",
-                            f"Horário: {it.get('horario','?')}",
-                            f"Parâmetros: {it.get('parametros','')}",
-                        ]
-                    )
-                )
-            return "  \n  \n".join(blocos)
-
-        cap_txt = f"{pacote.get('capacidade','N/A')} kWp"
-        facts = [("Capacidade", cap_txt)]
         usina = pacote.get("usina", "N/A")
-        severos = {"SOBRETENSÃO", "TÉRMICO", "BLOQUEIO"}
-        severity_falha = "danger" if any(i.get("tipo") in severos for i in novos) else "warning"
 
         ok_novos = True
         if novos:
-            texto = _formatar_blocos(novos)
+            card = _montar_card_rele_falha(pacote)
             logger_rele.warning(
                 f"[RELE] Falha | Usina: {usina} | Itens: {len(novos)} | "
-                + texto.replace("  \n", " | ")
+                + _formatar_blocos_rele(novos).replace("  \n", " | ")
             )
-            try:
-                ok_novos = _teams_post_card(
-                    title=f"⚠️ Falha de relé - {usina}",
-                    text=f"  \n{texto}",
-                    severity=severity_falha,
-                    facts=facts,
-                )
-            except Exception:
-                logger_rele.exception("Falha ao notificar Teams (rele falha)")
-                ok_novos = False
+            if card:
+                try:
+                    ok_novos = _teams_post_card(**card)
+                except Exception:
+                    logger_rele.exception("Falha ao notificar Teams (rele falha)")
+                    ok_novos = False
 
         ok_norm = True
         if normalizados:
-            texto = _formatar_blocos(normalizados)
+            card = _montar_card_rele_normalizacao(pacote)
             logger_rele.info(
                 f"[RELE] Normalizacao | Usina: {usina} | Itens: {len(normalizados)} | "
-                + texto.replace("  \n", " | ")
+                + _formatar_blocos_rele(normalizados).replace("  \n", " | ")
             )
-            try:
-                ok_norm = _teams_post_card(
-                    title=f"✔️ Normalização de relé - {usina}",
-                    text=f"  \n{texto}",
-                    severity="info",
-                    facts=facts,
-                )
-            except Exception:
-                logger_rele.exception("Falha ao notificar Teams (rele normalizacao)")
-                ok_norm = False
+            if card:
+                try:
+                    ok_norm = _teams_post_card(**card)
+                except Exception:
+                    logger_rele.exception("Falha ao notificar Teams (rele normalizacao)")
+                    ok_norm = False
 
         return ok_novos, ok_norm
 
-    # Monta mensagem de falha de inversor (Pac zerado) e envia para Teams.
-    def _notificar_inversor(self, alerta):
+    @staticmethod
+    def _preparar_contexto_notificacao_inversor(alerta: dict) -> tuple:
         inds = alerta.get("indicadores", {})
-        detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
+        detalhes_txt = f"Pac: {inds.get('pac', 'N/A')}"
         janela_inicio, janela_fim = _obter_janela_solar_inversor(alerta.get("usina"))
         janela_label = alerta.get("janela_solar_label", _formatar_janela_solar_label(janela_inicio, janela_fim))
         msg = (
@@ -2821,16 +2863,16 @@ class MonitorService:
             f"Horário: {alerta['horario']}\n"
             f"{detalhes_txt}"
         )
+        return detalhes_txt, janela_label, msg
+
+    # Monta mensagem de falha de inversor (Pac zerado) e envia para Teams.
+    def _notificar_inversor(self, alerta):
+        detalhes_txt, janela_label, msg = self._preparar_contexto_notificacao_inversor(alerta)
         logger_inv.warning(f"[ALERTA INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             return _teams_post_card(
                 title=f"⚠️ Falha de Inversor (Pac=0; {INVERTER_CONSECUTIVE_READINGS} leituras; {janela_label})",
-                text=(
-                    f"**Usina:** {alerta['usina']}  \n"
-                    f"**Inversor:** {alerta['inversor']}  \n"
-                    f"**Horário:** {alerta['horario']}  \n"
-                    f"**Detalhes:** {detalhes_txt}"
-                ),
+                text=_formatar_corpo_card_inversor(alerta, detalhes_txt),
                 severity="danger",
                 facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
             )
@@ -2840,27 +2882,12 @@ class MonitorService:
 
     # Comunica quando um inversor voltou a produzir apos falha de Pac 0.
     def _notificar_inversor_recuperado(self, alerta, alerta_prev=None):
-        inds = alerta.get("indicadores", {})
-        detalhes_txt = f"Pac: {inds.get('pac','N/A')}"
-        janela_inicio, janela_fim = _obter_janela_solar_inversor(alerta.get("usina"))
-        janela_label = alerta.get("janela_solar_label", _formatar_janela_solar_label(janela_inicio, janela_fim))
-        msg = (
-            f"Usina: {alerta['usina']}\n"
-            f"Inversor: {alerta['inversor']}\n"
-            f"Status: {alerta['status']}\n"
-            f"Horário: {alerta['horario']}\n"
-            f"{detalhes_txt}"
-        )
+        detalhes_txt, janela_label, msg = self._preparar_contexto_notificacao_inversor(alerta)
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             return _teams_post_card(
                 title=f"✔️ Normalização de Inversor (Pac normalizado; {INVERTER_RECOVERY_CONSECUTIVE_READINGS} leituras; {janela_label})",
-                text=(
-                    f"**Usina:** {alerta['usina']}  \n"
-                    f"**Inversor:** {alerta['inversor']}  \n"
-                    f"**Horário:** {alerta['horario']}  \n"
-                    f"**Detalhes:** {detalhes_txt}"
-                ),
+                text=_formatar_corpo_card_inversor(alerta, detalhes_txt),
                 severity="info",
                 facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
             )
