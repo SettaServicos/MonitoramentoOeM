@@ -1061,6 +1061,29 @@ def _plant_ids_retornados(plantas):
     return ids
 
 
+def _dedupe_por_base(itens: list) -> list:
+    vistos = set()
+    saida = []
+    for item in itens:
+        base = item.get("base")
+        if base and base in vistos:
+            continue
+        if base:
+            vistos.add(base)
+        saida.append(item)
+    return saida
+
+
+def _alerta_ts_key(item: dict):
+    ts = item.get("ts_iso")
+    if not ts:
+        return datetime.min
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return datetime.min
+
+
 # Servico central que orquestra varreduras de reles/inversores e envia notificacoes.
 class MonitorService:
     """Serviço headless: varre relés e inversores e notifica Teams."""
@@ -2380,18 +2403,6 @@ class MonitorService:
             self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
 
             # envia uma notificação por usina consolidando alertas novos, normalizados e pendentes
-            def _dedupe_por_base(itens):
-                vistos = set()
-                saida = []
-                for item in itens:
-                    base = item.get("base")
-                    if base and base in vistos:
-                        continue
-                    if base:
-                        vistos.add(base)
-                    saida.append(item)
-                return saida
-
             notification_jobs = []
             usinas = set(novos_por_usina.keys()) | set(resolvidos_por_usina.keys()) | set(pend_norm.keys())
             for usina_id in usinas:
@@ -2413,16 +2424,8 @@ class MonitorService:
 
                 pacote["novos"] = _dedupe_por_base(pacote["novos"])
                 pacote["normalizados"] = _dedupe_por_base(pacote["normalizados"])
-                def _ts_key(item):
-                    ts = item.get("ts_iso")
-                    if not ts:
-                        return datetime.min
-                    try:
-                        return datetime.fromisoformat(ts)
-                    except Exception:
-                        return datetime.min
-                pacote["novos"] = sorted(pacote["novos"], key=_ts_key)
-                pacote["normalizados"] = sorted(pacote["normalizados"], key=_ts_key)
+                pacote["novos"] = sorted(pacote["novos"], key=_alerta_ts_key)
+                pacote["normalizados"] = sorted(pacote["normalizados"], key=_alerta_ts_key)
                 if not pacote["novos"] and not pacote["normalizados"]:
                     continue
 
