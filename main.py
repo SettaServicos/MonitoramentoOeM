@@ -29,6 +29,7 @@ from statistics import median
 from collections import defaultdict
 from functools import lru_cache
 from zipfile import ZipFile, ZIP_DEFLATED
+from typing import TypedDict, Literal
 
 # =========================
 # CONFIGURACAO (EDITAR AQUI)
@@ -146,6 +147,39 @@ REPORT_DIR.mkdir(parents=True, exist_ok=True)
 WINDOW_DELTA_SECONDS = 1
 STATE_SCHEMA_VERSION = 1
 
+# ---------------------------------------------------------------------------
+# Tipos de dados — puramente documentais, sem efeito em runtime
+# ---------------------------------------------------------------------------
+SeverityLevel = Literal["info", "warning", "danger"]
+
+
+class CardTeams(TypedDict):
+    title: str
+    text: str
+    severity: SeverityLevel
+    facts: list[tuple[str, str]] | None
+
+
+class EstadoInversor(TypedDict):
+    ativa: bool
+    rec_seq: int
+    seq_zero: int
+    alerta: dict | None
+    notificado: bool
+    ausente_scans: int
+    ultima_confirmacao_ts: str | None
+
+
+class Incidente(TypedDict):
+    chave: str
+    natureza: str
+    tipo_falha: str
+    usina_id: str
+    usina: str | None
+    equipamento: str
+    inicio_ts: str
+    fim_ts: str | None
+
 
 def _configurar_logger_arquivo(name: str, log_dir: Path, log_filename: str, fmt, base_logger) -> logging.Logger:
     lgr = logging.getLogger(name)
@@ -212,7 +246,7 @@ def validate_config():
         )
 
 
-def _parse_retry_after_seconds(headers: dict) -> "int | None":
+def _parse_retry_after_seconds(headers: dict) -> int | None:
     """Parsa o header Retry-After e retorna o numero de segundos a esperar."""
     retry_after = (headers or {}).get("Retry-After")
     if not retry_after:
@@ -233,7 +267,7 @@ def _parse_retry_after_seconds(headers: dict) -> "int | None":
 
 
 # Envia cartao padrao (MessageCard) para Teams quando alertas ocorrem.
-def _teams_post_card(title, text, severity="info", facts=None):
+def _teams_post_card(title: str, text: str, severity: SeverityLevel = "info", facts: list[tuple[str, str]] | None = None) -> bool:
     """Envia um 'MessageCard' para um Incoming Webhook do Microsoft Teams."""
     if not TEAMS_ENABLED:
         return False
@@ -425,7 +459,7 @@ class PVOperationAPI:
         return ok
 
     # Recupera lista de plantas tratando expiracao de sessao e reconexao.
-    def get_plants(self):
+    def get_plants(self) -> list | None:
         url = f"{self.base_url}/plants"
         self.last_get_plants_timeout = False
         self.last_get_plants_error = False
@@ -457,7 +491,7 @@ class PVOperationAPI:
         return None
 
     # Faz chamada para endpoint diario (day_*) com retry e backoff exponencial leve.
-    def post_day(self, endpoint: str, plant_id: int, date: datetime):
+    def post_day(self, endpoint: str, plant_id: int, date: datetime) -> tuple:
         """Chama endpoints day_* com retry/backoff. Retorna (dados ou None, timeout_flag)."""
         payload = {"id": int(plant_id), "date": date.strftime("%Y-%m-%d")}
         url = f"{self.base_url}/{endpoint}"
@@ -483,7 +517,7 @@ class PVOperationAPI:
 
 
 # Normaliza valores numericos vindos como string ou numero bruto para float.
-def extrair_valor_numerico(valor):
+def extrair_valor_numerico(valor: str | int | float | bool | None) -> float | None:
     if isinstance(valor, bool):
         return float(valor)
     if isinstance(valor, (int, float)):
@@ -658,7 +692,7 @@ def _formatar_blocos_rele(itens: list) -> str:
     return "  \n  \n".join(blocos)
 
 
-def _montar_card_rele_falha(pacote: dict) -> "dict | None":
+def _montar_card_rele_falha(pacote: dict) -> CardTeams | None:
     novos = pacote.get("novos") or []
     if not novos:
         return None
@@ -674,7 +708,7 @@ def _montar_card_rele_falha(pacote: dict) -> "dict | None":
     }
 
 
-def _montar_card_rele_normalizacao(pacote: dict) -> "dict | None":
+def _montar_card_rele_normalizacao(pacote: dict) -> CardTeams | None:
     normalizados = pacote.get("normalizados") or []
     if not normalizados:
         return None
@@ -701,13 +735,13 @@ def _formatar_texto_heartbeat(
     *,
     rele_atrasado: bool,
     inv_atrasado: bool,
-    ultima_rele,
-    ultima_inv,
+    ultima_rele: datetime | None,
+    ultima_inv: datetime | None,
     ativos_rele: int,
     ativos_inv: int,
     rele_usinas: list,
     inv_usina_counts: dict,
-    previsto,
+    previsto: datetime,
 ) -> str:
     bullet_prefix = "    • "
     info = [
@@ -731,6 +765,7 @@ def _formatar_texto_heartbeat(
     return "  \n".join(info)
 
 
+# Ibimirim tem janela solar diferente das demais usinas — nome matching por substring.
 def _is_ibimirim_usina(usina_nome: str) -> bool:
     if not usina_nome:
         return False
@@ -738,7 +773,7 @@ def _is_ibimirim_usina(usina_nome: str) -> bool:
     return nome_normalizado in IBIMIRIM_INVERTER_PLANT_NAMES or "IBIMIRIM" in nome_normalizado
 
 
-def _obter_janela_solar_inversor(usina_nome: str = None):
+def _obter_janela_solar_inversor(usina_nome: str | None = None) -> tuple[dtime, dtime]:
     if _is_ibimirim_usina(usina_nome):
         return IBIMIRIM_INVERTER_SOLAR_WINDOW_START, IBIMIRIM_INVERTER_SOLAR_WINDOW_END
     return INVERTER_SOLAR_WINDOW_START, INVERTER_SOLAR_WINDOW_END
@@ -871,6 +906,19 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
     return candidatos, tem_dados, teve_timeout, max_ts_processado
 
 
+def _intervalo_atinge_janela(inicio_dt: datetime, fim_dt: datetime, janela_ini_t: dtime, janela_fim_t: dtime) -> bool:
+    if fim_dt < inicio_dt:
+        return False
+    dia = inicio_dt.date()
+    while dia <= fim_dt.date():
+        janela_ini = datetime.combine(dia, janela_ini_t)
+        janela_fim = datetime.combine(dia, janela_fim_t)
+        if inicio_dt <= janela_fim and fim_dt >= janela_ini:
+            return True
+        dia += timedelta(days=1)
+    return False
+
+
 # Avalia leituras de inversores para identificar falha (Pac 0) e recuperacao (Pac != 0).
 def detectar_falhas_inversores(
     api: PVOperationAPI,
@@ -881,9 +929,6 @@ def detectar_falhas_inversores(
     janela_inicio: dtime = INVERTER_SOLAR_WINDOW_START,
     janela_fim: dtime = INVERTER_SOLAR_WINDOW_END,
 ):
-    JANELA_INICIO = janela_inicio
-    JANELA_FIM = janela_fim
-
     leituras_por_inv = {}
     tem_dados = False
     tem_resposta = False
@@ -924,7 +969,7 @@ def detectar_falhas_inversores(
                 continue
             if not (inicio <= ts <= fim):
                 continue
-            if not (JANELA_INICIO <= ts.time() <= JANELA_FIM):
+            if not (janela_inicio <= ts.time() <= janela_fim):
                 continue
 
             pac_raw = None
@@ -934,16 +979,16 @@ def detectar_falhas_inversores(
                     break
 
             if pac_raw is None:
-                leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "cond_ok": False, "sem_dados": True, "pac": None})
+                leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "pac_zero": False, "sem_dados": True, "pac": None})
                 continue
 
             pac = extrair_valor_numerico(pac_raw)
             if pac is None:
-                leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "cond_ok": False, "sem_dados": True, "pac": None})
+                leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "pac_zero": False, "sem_dados": True, "pac": None})
                 continue
 
             cond = pac <= 0
-            leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "cond_ok": cond, "sem_dados": False, "pac": pac})
+            leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "pac_zero": cond, "sem_dados": False, "pac": pac})
             tem_dados = True
             if max_ts_processado is None or ts > max_ts_processado:
                 max_ts_processado = ts
@@ -987,7 +1032,7 @@ def detectar_falhas_inversores(
                 seq_zero = 0
                 rec_seq = 0
 
-            pac_zero = item["cond_ok"]  # True se potência == 0.0
+            pac_zero = item["pac_zero"]  # True se potência == 0.0
             if pac_zero:
                 seq_zero = seq_zero + 1
                 rec_seq = 0
@@ -1033,20 +1078,8 @@ def detectar_falhas_inversores(
             "tem_dado_valido": any(not item.get("sem_dados") for item in lst),
         }
 
-    def _intervalo_atinge_janela(inicio_dt: datetime, fim_dt: datetime) -> bool:
-        if fim_dt < inicio_dt:
-            return False
-        dia = inicio_dt.date()
-        while dia <= fim_dt.date():
-            janela_ini = datetime.combine(dia, JANELA_INICIO)
-            janela_fim = datetime.combine(dia, JANELA_FIM)
-            if inicio_dt <= janela_fim and fim_dt >= janela_ini:
-                return True
-            dia += timedelta(days=1)
-        return False
-
     # Fora da janela de geração, lista vazia não deve bloquear avanço de janela
-    dentro_janela = _intervalo_atinge_janela(inicio, fim)
+    dentro_janela = _intervalo_atinge_janela(inicio, fim, janela_inicio, janela_fim)
     tem_dados_efetivo = tem_dados or (tem_resposta and not dentro_janela)
     return falhas, recuperados, tem_dados_efetivo, falhas_ativas, teve_timeout, max_ts_processado
 
@@ -1074,7 +1107,7 @@ def _dedupe_por_base(itens: list) -> list:
     return saida
 
 
-def _alerta_ts_key(item: dict):
+def _alerta_ts_key(item: dict) -> datetime:
     ts = item.get("ts_iso")
     if not ts:
         return datetime.min
@@ -1082,6 +1115,43 @@ def _alerta_ts_key(item: dict):
         return datetime.fromisoformat(ts)
     except Exception:
         return datetime.min
+
+
+def _compor_entrada_estado_inversor(prev_entry: dict, estado_novo: dict, tem_dado_valido: bool) -> EstadoInversor:
+    entry = {
+        "ativa": bool(estado_novo.get("ativa", False)),
+        "rec_seq": int(estado_novo.get("rec_seq", 0)),
+        "seq_zero": int(estado_novo.get("seq_zero", 0)),
+        "alerta": prev_entry.get("alerta"),
+        "notificado": bool(prev_entry.get("notificado", False)),
+        "ausente_scans": (
+            0 if tem_dado_valido
+            else int(prev_entry.get("ausente_scans", 0))
+        ),
+        "ultima_confirmacao_ts": (
+            estado_novo.get("ultima_confirmacao_ts")
+            if tem_dado_valido
+            else prev_entry.get("ultima_confirmacao_ts")
+        ),
+    }
+    if not entry["ativa"]:
+        entry["alerta"] = None
+        entry["notificado"] = False
+        entry["ultima_confirmacao_ts"] = None
+    return entry
+
+
+def _montar_alerta_inversor(item: dict, nome: str, cap, janela_label_inv: str) -> dict:
+    return {
+        "usina": nome,
+        "capacidade": cap,
+        "inversor": item["inversor_id"],
+        "horario": item["ts_leitura"].strftime("%d/%m/%Y %H:%M:%S"),
+        "ts_iso": item["ts_leitura"].isoformat(),
+        "status": item["status"],
+        "indicadores": item.get("indicadores", {}),
+        "janela_solar_label": janela_label_inv,
+    }
 
 
 # Servico central que orquestra varreduras de reles/inversores e envia notificacoes.
@@ -1332,7 +1402,7 @@ class MonitorService:
         self.historico_incidentes = saida[-MAX_INCIDENT_HISTORY:]
 
     @staticmethod
-    def _novo_incidente(base_key: str, natureza: str, tipo_falha: str, usina_id: str, usina: str, equipamento: str, inicio_ts: datetime, fim_ts=None):
+    def _novo_incidente(base_key: str, natureza: str, tipo_falha: str, usina_id: str, usina: str | None, equipamento: str, inicio_ts: datetime, fim_ts: str | None = None) -> Incidente:
         inicio = inicio_ts if isinstance(inicio_ts, datetime) else datetime.now()
         return {
             "chave": str(base_key),
@@ -1377,6 +1447,36 @@ class MonitorService:
                 inicio_ts=inicio_dt,
             )
         self._fechar_incidente(incidente, fim_ts)
+
+    def _resolver_alerta_rele(self, base: str, fim_ts: datetime) -> dict | None:
+        alerta_antigo = self.rele_alerta_chave.get(base)
+        self.rele_alertas_ativos.discard(base)
+        self.rele_alerta_chave.pop(base, None)
+        self.rele_notificados.discard(base)
+        self._registrar_fim_incidente_rele(base=base, fim_ts=fim_ts, fallback_alerta=alerta_antigo)
+        return alerta_antigo
+
+    def _ativar_alerta_rele(
+        self,
+        base: str,
+        alerta_fmt: dict,
+        *,
+        usina_id: str,
+        nome: str | None,
+        rele_id: str,
+        tipo_alerta: str,
+        inicio_ts: datetime,
+    ) -> None:
+        self.rele_alertas_ativos.add(base)
+        self.rele_alerta_chave[base] = alerta_fmt
+        self._registrar_inicio_incidente_rele(
+            base=base,
+            usina_id=usina_id,
+            usina=nome,
+            rele_id=rele_id,
+            tipo_falha=tipo_alerta,
+            inicio_ts=inicio_ts,
+        )
 
     def _registrar_inicio_incidente_inversor(self, chave_inv: str, usina_id: str, usina: str, inversor_id: str, inicio_ts: datetime):
         if chave_inv not in self.incidentes_inv_ativos:
@@ -1714,6 +1814,9 @@ class MonitorService:
                 except Exception:
                     logger.exception("Erro na varredura de relé")
                 next_rele = datetime.now() + timedelta(seconds=RELAY_INTERVAL)
+
+            if self.stop_event.is_set():
+                break
 
             agora = datetime.now()
             if agora >= next_inv:
@@ -2339,35 +2442,19 @@ class MonitorService:
                         "parametros": f"{a['parametros']} | {intervalo_txt}" if intervalo_txt else a["parametros"],
                     }
 
-                    if base in self.rele_alertas_ativos:
-                        # atualiza detalhes com o último evento
-                        self.rele_alerta_chave[base] = alerta_fmt
-                        if base not in self.incidentes_rele_ativos:
-                            self._registrar_inicio_incidente_rele(
-                                base=base,
-                                usina_id=usina_id,
-                                usina=nome,
-                                rele_id=a["rele_id"],
-                                tipo_falha=a["tipo_alerta"],
-                                inicio_ts=a["ts_leitura"],
-                            )
-                        if base not in self.rele_notificados:
-                            novos_por_usina.setdefault(
-                                usina_id, {"usina": nome, "capacidade": cap, "itens": []}
-                            )["itens"].append(alerta_fmt)
-                        continue
-
-                    self.rele_alertas_ativos.add(base)
-                    self.rele_alerta_chave[base] = alerta_fmt
-                    self._registrar_inicio_incidente_rele(
-                        base=base,
+                    is_novo = base not in self.rele_alertas_ativos
+                    self._ativar_alerta_rele(
+                        base, alerta_fmt,
                         usina_id=usina_id,
-                        usina=nome,
+                        nome=nome,
                         rele_id=a["rele_id"],
-                        tipo_falha=a["tipo_alerta"],
+                        tipo_alerta=a["tipo_alerta"],
                         inicio_ts=a["ts_leitura"],
                     )
-                    novos_por_usina.setdefault(usina_id, {"usina": nome, "capacidade": cap, "itens": []})["itens"].append(alerta_fmt)
+                    if is_novo or base not in self.rele_notificados:
+                        novos_por_usina.setdefault(
+                            usina_id, {"usina": nome, "capacidade": cap, "itens": []}
+                        )["itens"].append(alerta_fmt)
 
                 if max_ts_rele is not None:
                     self.ultima_varredura_rele_por_usina[usina_id] = max_ts_rele
@@ -2378,11 +2465,7 @@ class MonitorService:
                         bases_ativos_atual.add(base)
             resolved = self.rele_alertas_ativos - bases_ativos_atual
             for base in resolved:
-                alerta_antigo = self.rele_alerta_chave.get(base)
-                self.rele_alertas_ativos.discard(base)
-                self.rele_alerta_chave.pop(base, None)
-                self.rele_notificados.discard(base)
-                self._registrar_fim_incidente_rele(base=base, fim_ts=agora, fallback_alerta=alerta_antigo)
+                alerta_antigo = self._resolver_alerta_rele(base, fim_ts=agora)
                 if alerta_antigo:
                     usina_id, rele_id, tipo = base.split(":", 2)
                     resolvidos_por_usina.setdefault(
@@ -2556,21 +2639,14 @@ class MonitorService:
                         inv_base = item["inversor_id"]
                         chave_inv = f"{usina_id}:{inv_base}"
                         alerta_prev = self.estado_inversores.get(chave_inv, {}).get("alerta")
-                        alerta = {
-                            "usina": nome,
-                            "capacidade": cap,
-                            "inversor": inv_base,
-                            "horario": item["ts_leitura"].strftime("%d/%m/%Y %H:%M:%S"),
-                            "ts_iso": item["ts_leitura"].isoformat(),
-                            "status": item["status"],
-                            "indicadores": item.get("indicadores", {}),
-                            "janela_solar_label": janela_label_inv,
-                        }
+                        alerta = _montar_alerta_inversor(item, nome, cap, janela_label_inv)
                         pend_norm[chave_inv] = {"alerta": alerta, "alerta_prev": alerta_prev}
                         notification_inv_jobs.append({"tipo": "rec", "chave": chave_inv, "alerta": alerta, "alerta_prev": alerta_prev})
                         if chave_inv in self.estado_inversores:
-                            self.estado_inversores[chave_inv]["alerta"] = None
-                            self.estado_inversores[chave_inv]["notificado"] = False
+                            entry_rec = self.estado_inversores[chave_inv]
+                            entry_rec["alerta"] = None
+                            entry_rec["notificado"] = False
+                            self.estado_inversores[chave_inv] = entry_rec
                         self._registrar_fim_incidente_inversor(
                             chave_inv=chave_inv,
                             fim_ts=item["ts_leitura"],
@@ -2585,16 +2661,7 @@ class MonitorService:
                             chave_inv,
                             {"ativa": True, "rec_seq": 0, "seq_zero": 0, "alerta": None, "notificado": False},
                         )
-                        alerta = {
-                            "usina": nome,
-                            "capacidade": cap,
-                            "inversor": item["inversor_id"],
-                            "horario": item["ts_leitura"].strftime("%d/%m/%Y %H:%M:%S"),
-                            "ts_iso": item["ts_leitura"].isoformat(),
-                            "status": item["status"],
-                            "indicadores": item.get("indicadores", {}),
-                            "janela_solar_label": janela_label_inv,
-                        }
+                        alerta = _montar_alerta_inversor(item, nome, cap, janela_label_inv)
                         entry["alerta"] = alerta
                         self._registrar_inicio_incidente_inversor(
                             chave_inv=chave_inv,
@@ -2639,27 +2706,9 @@ class MonitorService:
                         continue
                     prev_entry = self.estado_inversores.get(chave_inv, {})
                     tem_dado_valido = chave_inv in chaves_observadas
-                    entry = {
-                        "ativa": bool(estado.get("ativa", False)),
-                        "rec_seq": int(estado.get("rec_seq", 0)),
-                        "seq_zero": int(estado.get("seq_zero", 0)),
-                        "alerta": prev_entry.get("alerta"),
-                        "notificado": bool(prev_entry.get("notificado", False)),
-                        "ausente_scans": (
-                            0 if tem_dado_valido
-                            else int(prev_entry.get("ausente_scans", 0))
-                        ),
-                        "ultima_confirmacao_ts": (
-                            estado.get("ultima_confirmacao_ts")
-                            if tem_dado_valido
-                            else prev_entry.get("ultima_confirmacao_ts")
-                        ),
-                    }
-                    if not entry["ativa"]:
-                        entry["alerta"] = None
-                        entry["notificado"] = False
-                        entry["ultima_confirmacao_ts"] = None
-                    self.estado_inversores[chave_inv] = entry
+                    self.estado_inversores[chave_inv] = _compor_entrada_estado_inversor(
+                        prev_entry, estado, tem_dado_valido
+                    )
 
                 if max_ts_inv is not None:
                     self.ultima_varredura_inversor_por_usina[usina_id] = max_ts_inv
@@ -2712,7 +2761,7 @@ class MonitorService:
 
     # Formata intervalo de tempo das leituras para texto amigavel.
     @staticmethod
-    def formatar_intervalo_alerta(ts_first, ts_last) -> str:
+    def formatar_intervalo_alerta(ts_first: datetime | None, ts_last: datetime | None) -> str:
         if not ts_first or not ts_last:
             return ""
         if ts_first == ts_last:
@@ -2720,7 +2769,7 @@ class MonitorService:
         return f"Primeiro alerta às {ts_first.strftime('%H:%M')} e último às {ts_last.strftime('%H:%M')}"
 
     @staticmethod
-    def _inversor_conta_no_heartbeat(estado, referencia: datetime) -> bool:
+    def _inversor_conta_no_heartbeat(estado: dict, referencia: datetime) -> bool:
         if not isinstance(estado, dict):
             return False
         if not estado.get("ativa"):
@@ -2816,7 +2865,7 @@ class MonitorService:
             logger.exception("Falha ao enviar heartbeat")
 
     # Monta e envia notificacao de falha/normalizacao de relé por usina.
-    def _notificar_rele_agrupado(self, pacote):
+    def _notificar_rele_agrupado(self, pacote: dict) -> tuple[bool, bool]:
         novos = pacote.get("novos", []) or []
         normalizados = pacote.get("normalizados", []) or []
         if not novos and not normalizados:
@@ -2870,7 +2919,7 @@ class MonitorService:
         return detalhes_txt, janela_label, msg
 
     # Monta mensagem de falha de inversor (Pac zerado) e envia para Teams.
-    def _notificar_inversor(self, alerta):
+    def _notificar_inversor(self, alerta: dict) -> bool:
         detalhes_txt, janela_label, msg = self._preparar_contexto_notificacao_inversor(alerta)
         logger_inv.warning(f"[ALERTA INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
@@ -2885,7 +2934,7 @@ class MonitorService:
             return False
 
     # Comunica quando um inversor voltou a produzir apos falha de Pac 0.
-    def _notificar_inversor_recuperado(self, alerta, alerta_prev=None):
+    def _notificar_inversor_recuperado(self, alerta: dict, alerta_prev: dict | None = None) -> bool:
         detalhes_txt, janela_label, msg = self._preparar_contexto_notificacao_inversor(alerta)
         logger_inv.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
@@ -2934,6 +2983,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-# sanity check:
-# - Alertas de rele: ts_primeiro/ts_ultimo adicionados e parametros agregados sem duplicatas; ts_leitura aponta para o ultimo evento.
-# - PVOperationAPI._request_with_retry faz retry/backoff em Timeout, ConnectionError/RequestException, HTTP 5xx e 429 (Retry-After quando presente).
