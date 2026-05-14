@@ -7,30 +7,36 @@
 #   de CA válido (ex.: .pem fornecido pela infra) ou ajuste VERIFY_CA.
 # ===========================================
 
+import atexit
+import json
+import logging
 # Imports principais: bibliotecas nativas e de terceiros usadas em toda a aplicacao.
 import os
-import json
-import time
-import logging
-from logging.handlers import TimedRotatingFileHandler
+import re
+import signal
+import socket
+import sys
 import threading
-from datetime import datetime, timedelta, time as dtime
+import time
+from collections import defaultdict
+from datetime import datetime
+from datetime import time as dtime
+from datetime import timedelta
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from statistics import median
+from typing import Literal, TypedDict
+from zipfile import ZIP_DEFLATED, ZipFile
+
+import requests
+from dotenv import load_dotenv
 from requests import Session
 from requests.exceptions import Timeout
-import requests
-import re
-import atexit
-import sys
-import socket
-import signal
-from statistics import median
-from collections import defaultdict
-from functools import lru_cache
-from zipfile import ZipFile, ZIP_DEFLATED
-from typing import TypedDict, Literal
 
+
+load_dotenv()
 # =========================
 # CONFIGURACAO VIA AMBIENTE
 # =========================
@@ -3201,4 +3207,3 @@ def main():
 # Executa a aplicacao somente quando o arquivo for chamado diretamente.
 if __name__ == "__main__":
     main()
-
