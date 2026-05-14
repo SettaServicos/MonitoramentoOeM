@@ -338,6 +338,9 @@ class PVOperationAPI:
         self.headers = {}
         self.last_get_plants_timeout = False
         self.last_get_plants_error = False
+        self.last_post_day_timeout = False
+        self.last_post_day_error = False
+        self.last_post_day_error_reason = None
         self._login()
 
     def _reset_session(self):
@@ -503,6 +506,9 @@ class PVOperationAPI:
     # Faz chamada para endpoint diario (day_*) com retry e backoff exponencial leve.
     def post_day(self, endpoint: str, plant_id: int, date: datetime) -> tuple:
         """Chama endpoints day_* com retry/backoff. Retorna (dados ou None, timeout_flag)."""
+        self.last_post_day_timeout = False
+        self.last_post_day_error = False
+        self.last_post_day_error_reason = None
         payload = {"id": int(plant_id), "date": date.strftime("%Y-%m-%d")}
         url = f"{self.base_url}/{endpoint}"
         contexto = f"{endpoint} (usina {plant_id}, {date.date()})"
@@ -520,13 +526,21 @@ class PVOperationAPI:
             conn_error_suffix="Tentando recriar sessão.",
         )
         if r is None:
+            self.last_post_day_timeout = bool(timeout_flag)
+            self.last_post_day_error = True
+            self.last_post_day_error_reason = "TIMEOUT" if timeout_flag else "REQUEST_ERROR"
             return None, timeout_flag
         if r.status_code == 200:
             try:
                 return r.json(), False
             except Exception as e:
                 logger.error(f"Resposta não-JSON em {contexto} (status 200): {e}")
+                self.last_post_day_error = True
+                self.last_post_day_error_reason = "JSON_INVALID"
                 return None, False
+        self.last_post_day_error = True
+        self.last_post_day_error_reason = f"HTTP_{r.status_code}"
+        logger.error(f"Erro em {contexto}. Status: {r.status_code}")
         return None, False
 
 
@@ -867,7 +881,7 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
     d = inicio.date()
     while d <= fim.date():
         data_resp, timeout_flag = api.post_day("day_relay", int(plant_id), datetime.combine(d, datetime.min.time()))
-        if timeout_flag:
+        if timeout_flag or getattr(api, "last_post_day_error", False):
             teve_timeout = True
         if data_resp is None:
             d += timedelta(days=1)
@@ -939,6 +953,10 @@ def _intervalo_atinge_janela(inicio_dt: datetime, fim_dt: datetime, janela_ini_t
     return False
 
 
+def _horario_esta_na_janela(referencia: datetime, janela_ini_t: dtime, janela_fim_t: dtime) -> bool:
+    return janela_ini_t <= referencia.time() <= janela_fim_t
+
+
 # Avalia leituras de inversores para identificar falha (Pac 0) e recuperacao (Pac != 0).
 def detectar_falhas_inversores(
     api: PVOperationAPI,
@@ -952,13 +970,14 @@ def detectar_falhas_inversores(
     leituras_por_inv = {}
     tem_dados = False
     tem_resposta = False
+    tem_registro_api = False
     teve_timeout = False
     max_ts_processado = None
 
     d = inicio.date()
     while d <= fim.date():
         data_resp, timeout_flag = api.post_day("day_inverter", int(plant_id), datetime.combine(d, datetime.min.time()))
-        if timeout_flag:
+        if timeout_flag or getattr(api, "last_post_day_error", False):
             teve_timeout = True
         if data_resp is None:
             d += timedelta(days=1)
@@ -969,6 +988,8 @@ def detectar_falhas_inversores(
             d += timedelta(days=1)
             continue
         tem_resposta = True
+        if data_resp:
+            tem_registro_api = True
 
         for reg, conteudo_raw, ts in _iterar_registros_api_dia(data_resp, "day_inverter", plant_id, logger_inv):
             inv_id = reg.get("idinversor") or conteudo_raw.get("Inversor") or conteudo_raw.get("esn")
@@ -1086,9 +1107,11 @@ def detectar_falhas_inversores(
             "tem_dado_valido": any(not item.get("sem_dados") for item in lst),
         }
 
-    # Fora da janela de geração, lista vazia não deve bloquear avanço de janela
-    dentro_janela = _intervalo_atinge_janela(inicio, fim, janela_inicio, janela_fim)
-    tem_dados_efetivo = tem_dados or (tem_resposta and not dentro_janela)
+    # Fora do horario ativo do inversor, lista vazia nao deve virar SEM_DADOS
+    # so porque o checkpoint por max_ts ainda encosta na cauda da janela solar.
+    fim_dentro_janela = _horario_esta_na_janela(fim, janela_inicio, janela_fim)
+    resposta_vazia_fora_janela = tem_resposta and not tem_registro_api and not fim_dentro_janela
+    tem_dados_efetivo = tem_dados or resposta_vazia_fora_janela
     return falhas, recuperados, tem_dados_efetivo, falhas_ativas, teve_timeout, max_ts_processado
 
 
