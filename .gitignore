@@ -8,6 +8,8 @@ env/
 venv/
 .venv/
 .env
+.env.*
+!.env.example
 
 # IDE
 .vscode/
@@ -22,6 +24,18 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Secrets and local certificates
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+*.token
+*.secret
+credentials*.json
+secrets*.json
 
 # State/locks/caches
 monitor_state*.json*

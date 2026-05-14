@@ -15,6 +15,8 @@ Monitor headless que varre relés e inversores via API PVOperation e envia alert
 - Garante **instância única** via lock de arquivo.
 
 ---
+''  
+
 
 ## Arquivo de produção recomendado
 
@@ -36,7 +38,7 @@ Monitor headless que varre relés e inversores via API PVOperation e envia alert
 - `tem_dados` só é `True` após passar o filtro temporal — dado fora da janela não conta.
 - O checkpoint avança por `max_ts_processado` (timestamp máximo processado), não por `datetime.now()`.
 
-### Detecção de alerta
+### Detecção de alerta.
 
 - Parâmetros do relé (`RELAY_PARAMETROS`) com valor ativo (`True`, `1`, `"true"`) indicam falha.
 - Alertas são agrupados por `(usina, rele_id, tipo_alerta)` e acumulam todos os parâmetros ativos do intervalo.

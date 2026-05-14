@@ -32,13 +32,13 @@ from zipfile import ZipFile, ZIP_DEFLATED
 from typing import TypedDict, Literal
 
 # =========================
-# CONFIGURACAO (EDITAR AQUI)
+# CONFIGURACAO VIA AMBIENTE
 # =========================
-PVOP_BASE_URL = "https://apipv.pvoperation.com.br/api/v1"
-PVOP_EMAIL = "monitoramento@settaenergia.com.br"
-PVOP_PASSWORD = "$$Setta1324"
-TEAMS_WEBHOOK_URL = "https://settaenergiarecife.webhook.office.com/webhookb2/ff6efec5-9ceb-4932-89ba-d4d8082a1975@77b21bc1-b0b7-4df6-9225-2e24fc9de0f6/IncomingWebhook/38f7efca2b124a17abc7dcc8a5a40c95/a29266d7-870f-4855-96b0-c21a4710f37b/V2rB2XbXOgznVTxAoIWIeDPnlRZ203j0jsNsLKr4cNK141"
-TEAMS_ENABLED = True
+PVOP_BASE_URL = os.environ.get("PVOP_BASE_URL", "https://apipv.pvoperation.com.br/api/v1").strip()
+PVOP_EMAIL = os.environ.get("MONITOR_EMAIL", "").strip()
+PVOP_PASSWORD = os.environ.get("MONITOR_PASSWORD", "").strip()
+TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "").strip()
+TEAMS_ENABLED = bool(TEAMS_WEBHOOK_URL)
 # =========================
 
 # Lock de instância: fcntl (Unix) ou msvcrt (Windows)
@@ -56,6 +56,7 @@ except ImportError:
 RELAY_INTERVAL = 600          # 10 min
 INVERTER_INTERVAL = 900       # 15 min
 PLANTS_CACHE_TTL = timedelta(seconds=RELAY_INTERVAL)  # relay e inversor partilham a mesma lista
+RELAY_NOTIFICATION_RETRY_COOLDOWN = timedelta(seconds=RELAY_INTERVAL)
 SAVE_STATE_FAIL_THRESHOLD = 3
 STOP_JOIN_TIMEOUT = 35        # aguarda encerramento das threads antes de forcar saida
 HEARTBEAT_TIMES = [
@@ -230,19 +231,16 @@ def validate_config():
     if _is_placeholder(PVOP_BASE_URL):
         missing.append("PVOP_BASE_URL")
     if _is_placeholder(PVOP_EMAIL):
-        missing.append("PVOP_EMAIL")
+        missing.append("MONITOR_EMAIL")
     if _is_placeholder(PVOP_PASSWORD):
-        missing.append("PVOP_PASSWORD")
+        missing.append("MONITOR_PASSWORD")
+    if _is_placeholder(TEAMS_WEBHOOK_URL):
+        missing.append("TEAMS_WEBHOOK_URL")
     if missing:
         raise SystemExit(
-            "Configuracao obrigatoria ausente ou placeholder: "
+            "Configuracao obrigatoria ausente ou placeholder em variaveis de ambiente: "
             + ", ".join(missing)
-            + ". Edite a secao CONFIGURACAO no topo do main.py."
-        )
-    if TEAMS_ENABLED and _is_placeholder(TEAMS_WEBHOOK_URL):
-        raise SystemExit(
-            "TEAMS_ENABLED=True, mas TEAMS_WEBHOOK_URL esta ausente ou placeholder. "
-            "Edite a secao CONFIGURACAO no topo do main.py."
+            + ". Configure o ambiente do servico ou crie um .env local nao versionado."
         )
 
 
@@ -267,7 +265,13 @@ def _parse_retry_after_seconds(headers: dict) -> int | None:
 
 
 # Envia cartao padrao (MessageCard) para Teams quando alertas ocorrem.
-def _teams_post_card(title: str, text: str, severity: SeverityLevel = "info", facts: list[tuple[str, str]] | None = None) -> bool:
+def _teams_post_card(
+    title: str,
+    text: str,
+    severity: SeverityLevel = "info",
+    facts: list[tuple[str, str]] | None = None,
+    max_tentativas: int = 3,
+) -> bool:
     """Envia um 'MessageCard' para um Incoming Webhook do Microsoft Teams."""
     if not TEAMS_ENABLED:
         return False
@@ -283,7 +287,7 @@ def _teams_post_card(title: str, text: str, severity: SeverityLevel = "info", fa
     }
     if facts:
         payload["sections"] = [{"facts": [{"name": k, "value": v} for k, v in facts]}]
-    max_tentativas = 3
+    max_tentativas = max(1, int(max_tentativas or 1))
     backoff_base = 2
     for tentativa in range(1, max_tentativas + 1):
         try:
@@ -512,7 +516,11 @@ class PVOperationAPI:
         if r is None:
             return None, timeout_flag
         if r.status_code == 200:
-            return r.json(), False
+            try:
+                return r.json(), False
+            except Exception as e:
+                logger.error(f"Resposta não-JSON em {contexto} (status 200): {e}")
+                return None, False
         return None, False
 
 
@@ -821,6 +829,28 @@ def _rele_param_ativo(valor) -> bool:
     return False
 
 
+def _iterar_registros_api_dia(data_resp, endpoint: str, plant_id: str, logger_ctx):
+    if not isinstance(data_resp, list):
+        logger_ctx.warning(f"Resposta inesperada em {endpoint} (usina {plant_id}): {type(data_resp).__name__}")
+        return
+
+    for registro in (data_resp or []):
+        if not isinstance(registro, dict):
+            logger_ctx.warning(f"Item inesperado em {endpoint} (usina {plant_id}): {type(registro).__name__}")
+            continue
+        conteudo_raw = registro.get("conteudojson", {})
+        if not isinstance(conteudo_raw, dict):
+            logger_ctx.warning(
+                f"conteudojson invalido em {endpoint} (usina {plant_id}): {type(conteudo_raw).__name__}"
+            )
+            continue
+        try:
+            ts = datetime.strptime(conteudo_raw.get("tsleitura", ""), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+        yield registro, conteudo_raw, ts
+
+
 # Varre leituras de rele no intervalo informado para encontrar eventos e classifica-los.
 def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, fim: datetime):
     agrupados = {}
@@ -837,27 +867,9 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
             d += timedelta(days=1)
             continue
 
-        if not isinstance(data_resp, list):
-            logger_rele.warning(f"Resposta inesperada em day_relay (usina {plant_id}): {type(data_resp).__name__}")
-            d += timedelta(days=1)
-            continue
-
-        for registro in (data_resp or []):
-            if not isinstance(registro, dict):
-                logger_rele.warning(f"Item inesperado em day_relay (usina {plant_id}): {type(registro).__name__}")
-                continue
-            conteudo_raw = registro.get("conteudojson", {})
-            if not isinstance(conteudo_raw, dict):
-                logger_rele.warning(
-                    f"conteudojson invalido em day_relay (usina {plant_id}): {type(conteudo_raw).__name__}"
-                )
-                continue
+        for registro, conteudo_raw, ts in _iterar_registros_api_dia(data_resp, "day_relay", plant_id, logger_rele):
             idrele = registro.get("idrele")
             if not idrele:
-                continue
-            try:
-                ts = datetime.strptime(conteudo_raw.get("tsleitura", ""), "%Y-%m-%d %H:%M:%S")
-            except Exception:
                 continue
             if not (inicio <= ts <= fim):
                 continue
@@ -875,7 +887,8 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
                     tipo = classe
                     break
 
-            base = f"{plant_id}:{idrele}:{tipo}"
+            parametros_chave = _normalizar_parametros_rele(ativos)
+            base = _chave_evento_rele(plant_id, idrele, tipo, parametros_chave)
             entry = agrupados.get(base)
             if not entry:
                 agrupados[base] = {
@@ -884,6 +897,7 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
                     "ts_ultimo": ts,
                     "rele_id": idrele,
                     "parametros_set": set(ativos),
+                    "parametros_chave": parametros_chave,
                     "tipo_alerta": tipo,
                 }
             else:
@@ -944,29 +958,17 @@ def detectar_falhas_inversores(
             d += timedelta(days=1)
             continue
         if not isinstance(data_resp, list):
-            logger_inv.warning(f"Resposta inesperada em day_inverter (usina {plant_id}): {type(data_resp).__name__}")
+            for _ in _iterar_registros_api_dia(data_resp, "day_inverter", plant_id, logger_inv):
+                pass
             d += timedelta(days=1)
             continue
         tem_resposta = True
 
-        for reg in (data_resp or []):
-            if not isinstance(reg, dict):
-                logger_inv.warning(f"Item inesperado em day_inverter (usina {plant_id}): {type(reg).__name__}")
-                continue
-            conteudo_raw = reg.get("conteudojson", {})
-            if not isinstance(conteudo_raw, dict):
-                logger_inv.warning(
-                    f"conteudojson invalido em day_inverter (usina {plant_id}): {type(conteudo_raw).__name__}"
-                )
-                continue
+        for reg, conteudo_raw, ts in _iterar_registros_api_dia(data_resp, "day_inverter", plant_id, logger_inv):
             inv_id = reg.get("idinversor") or conteudo_raw.get("Inversor") or conteudo_raw.get("esn")
             if not inv_id:
                 continue
             inv_id = str(inv_id)
-            try:
-                ts = datetime.strptime(conteudo_raw.get("tsleitura", ""), "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                continue
             if not (inicio <= ts <= fim):
                 continue
             if not (janela_inicio <= ts.time() <= janela_fim):
@@ -1094,6 +1096,51 @@ def _plant_ids_retornados(plantas):
     return ids
 
 
+def _normalizar_campo_chave_rele(valor) -> str:
+    return re.sub(r"\s+", " ", str(valor or "").strip()).lower()
+
+
+def _normalizar_parametros_rele(parametros) -> str:
+    if parametros is None:
+        partes = []
+    elif isinstance(parametros, str):
+        partes = parametros.split("|", 1)[0].split(",")
+    else:
+        partes = list(parametros)
+    normalizados = {
+        _normalizar_campo_chave_rele(p)
+        for p in partes
+        if _normalizar_campo_chave_rele(p)
+    }
+    return ",".join(sorted(normalizados))
+
+
+def _chave_evento_rele(usina_id, rele_id, tipo_alerta, parametros) -> str:
+    return ":".join([
+        _normalizar_campo_chave_rele(usina_id),
+        _normalizar_campo_chave_rele(rele_id),
+        _normalizar_campo_chave_rele(tipo_alerta),
+        _normalizar_parametros_rele(parametros),
+    ])
+
+
+def _chave_legada_rele(usina_id, rele_id, tipo_alerta) -> str:
+    return ":".join([
+        _normalizar_campo_chave_rele(usina_id),
+        _normalizar_campo_chave_rele(rele_id),
+        _normalizar_campo_chave_rele(tipo_alerta),
+    ])
+
+
+def _partes_chave_rele(base: str) -> tuple[str, str, str, str]:
+    partes = str(base or "").split(":", 3)
+    if len(partes) == 4:
+        return partes[0], partes[1], partes[2], partes[3]
+    if len(partes) == 3:
+        return partes[0], partes[1], partes[2], ""
+    return "N/A", str(base), "OUTROS", ""
+
+
 def _dedupe_por_base(itens: list) -> list:
     vistos = set()
     saida = []
@@ -1163,9 +1210,10 @@ class MonitorService:
         self.ultima_varredura_inversor = None
         self.ultima_varredura_rele_por_usina = {}
         self.ultima_varredura_inversor_por_usina = {}
-        self.rele_alertas_ativos = set()      # usina:rele:tipo
+        self.rele_alertas_ativos = set()      # usina:rele:tipo:parametros
         self.rele_alerta_chave = {}
         self.rele_notificados = set()
+        self.rele_notificacao_retry_after = {}
         self.estado_inversores = {}           # usina:inv -> estado (seq + alerta)
         self.pending_notifications = {"rele_normalizados": {}, "inv_normalizados": {}}
         self.usinas_alerta_rele_recente = set()
@@ -1431,11 +1479,7 @@ class MonitorService:
         incidente = self.incidentes_rele_ativos.pop(base, None)
         if incidente is None:
             alerta = fallback_alerta if isinstance(fallback_alerta, dict) else {}
-            partes = str(base).split(":", 2)
-            if len(partes) == 3:
-                usina_id, rele_id, tipo = partes
-            else:
-                usina_id, rele_id, tipo = "N/A", str(base), "OUTROS"
+            usina_id, rele_id, tipo, _ = _partes_chave_rele(base)
             inicio_dt = _parse_iso_datetime(alerta.get("ts_iso")) or fim_ts
             incidente = self._novo_incidente(
                 base_key=base,
@@ -1448,13 +1492,55 @@ class MonitorService:
             )
         self._fechar_incidente(incidente, fim_ts)
 
+    def _migrar_chave_rele_ativa(self, chave_antiga: str, chave_nova: str) -> None:
+        if not chave_antiga or chave_antiga == chave_nova:
+            return
+        migrado = False
+        if chave_antiga in self.rele_alertas_ativos:
+            self.rele_alertas_ativos.discard(chave_antiga)
+            self.rele_alertas_ativos.add(chave_nova)
+            migrado = True
+        if chave_antiga in self.rele_notificados:
+            self.rele_notificados.discard(chave_antiga)
+            self.rele_notificados.add(chave_nova)
+            migrado = True
+        retry_after = self.rele_notificacao_retry_after.pop(chave_antiga, None)
+        if retry_after is not None:
+            self.rele_notificacao_retry_after.setdefault(chave_nova, retry_after)
+            migrado = True
+        alerta_antigo = self.rele_alerta_chave.pop(chave_antiga, None)
+        if alerta_antigo is not None:
+            if chave_nova not in self.rele_alerta_chave:
+                self.rele_alerta_chave[chave_nova] = alerta_antigo
+            migrado = True
+        incidente = self.incidentes_rele_ativos.pop(chave_antiga, None)
+        if incidente is not None:
+            if chave_nova not in self.incidentes_rele_ativos:
+                incidente["chave"] = chave_nova
+                self.incidentes_rele_ativos[chave_nova] = incidente
+            migrado = True
+        if migrado:
+            logger_rele.info(f"[RELE] Chave legada migrada | antiga={chave_antiga} | nova={chave_nova}")
+
     def _resolver_alerta_rele(self, base: str, fim_ts: datetime) -> dict | None:
         alerta_antigo = self.rele_alerta_chave.get(base)
         self.rele_alertas_ativos.discard(base)
         self.rele_alerta_chave.pop(base, None)
         self.rele_notificados.discard(base)
+        self.rele_notificacao_retry_after.pop(base, None)
         self._registrar_fim_incidente_rele(base=base, fim_ts=fim_ts, fallback_alerta=alerta_antigo)
         return alerta_antigo
+
+    def _retry_rele_adiado(self, base: str, agora: datetime) -> bool:
+        retry_after = _parse_iso_datetime(self.rele_notificacao_retry_after.get(base))
+        if retry_after is None:
+            self.rele_notificacao_retry_after.pop(base, None)
+            return False
+        return agora < retry_after
+
+    def _agendar_retry_rele(self, base: str, agora: datetime) -> None:
+        retry_after = agora + RELAY_NOTIFICATION_RETRY_COOLDOWN
+        self.rele_notificacao_retry_after[base] = retry_after.isoformat()
 
     def _ativar_alerta_rele(
         self,
@@ -1577,6 +1663,12 @@ class MonitorService:
             )
             self.rele_alertas_ativos = set(data.get("rele_alertas_ativos", []))
             self.rele_notificados = set(data.get("rele_notificados", []))
+            self.rele_notificacao_retry_after = {}
+            raw_retry_rele = data.get("rele_notificacao_retry_after", {})
+            if isinstance(raw_retry_rele, dict):
+                for base, retry_after in raw_retry_rele.items():
+                    if _parse_iso_datetime(retry_after) is not None:
+                        self.rele_notificacao_retry_after[str(base)] = str(retry_after)
             self.rele_alerta_chave = data.get("rele_alerta_chave", {})
             self.estado_inversores = {}
             self.pending_notifications = {"rele_normalizados": {}, "inv_normalizados": {}}
@@ -1709,10 +1801,7 @@ class MonitorService:
                     continue
                 if not isinstance(base, str) or ":" not in base:
                     continue
-                partes = base.split(":", 2)
-                if len(partes) != 3:
-                    continue
-                usina_id, rele_id, tipo = partes
+                usina_id, rele_id, tipo, _ = _partes_chave_rele(base)
                 alerta = self.rele_alerta_chave.get(base, {})
                 inicio = _parse_iso_datetime(alerta.get("ts_iso")) or datetime.now()
                 self.incidentes_rele_ativos[base] = self._novo_incidente(
@@ -1755,6 +1844,7 @@ class MonitorService:
             self._init_state_defaults()
             self._save_state()
         except Exception as e:
+            self._backup_corrupt_state(f"erro inesperado ao carregar state: {e}")
             self._init_state_defaults()
             logger.warning(f"Não foi possível carregar estado salvo: {e}")
 
@@ -1775,6 +1865,7 @@ class MonitorService:
                 },
                 "rele_alertas_ativos": list(self.rele_alertas_ativos),
                 "rele_notificados": list(self.rele_notificados),
+                "rele_notificacao_retry_after": self.rele_notificacao_retry_after,
                 "rele_alerta_chave": self.rele_alerta_chave,
                 "estado_inversores": self.estado_inversores,
                 "pending_notifications": self.pending_notifications,
@@ -1876,6 +1967,13 @@ class MonitorService:
         return ""
 
     def _classificar_rele_conteudo_relatorio(self, conteudo):
+        identidade = self._identidade_rele_conteudo_relatorio(conteudo)
+        if not identidade:
+            return None
+        tipo, _ = identidade
+        return tipo
+
+    def _identidade_rele_conteudo_relatorio(self, conteudo):
         if not isinstance(conteudo, dict):
             return None
         ativos = [p for p in conteudo if p in RELAY_PARAMETROS and _rele_param_ativo(conteudo[p])]
@@ -1886,7 +1984,7 @@ class MonitorService:
             if any(p in lista for p in ativos):
                 tipo = classe
                 break
-        return tipo
+        return tipo, _normalizar_parametros_rele(ativos)
 
     def _coletar_incidentes_rele_semana_api(self, usina_id: str, usina_nome: str, inicio_semana: datetime, fim_semana: datetime):
         inicio_busca = inicio_semana - timedelta(days=WEEKLY_REPORT_WARMUP_DAYS)
@@ -1921,25 +2019,26 @@ class MonitorService:
                     continue
                 if ts < inicio_busca or ts > fim_busca:
                     continue
-                tipo = self._classificar_rele_conteudo_relatorio(conteudo)
-                leituras_por_rele[str(rele_id)].append((ts, tipo))
+                identidade = self._identidade_rele_conteudo_relatorio(conteudo)
+                leituras_por_rele[str(rele_id)].append((ts, identidade))
             dia += timedelta(days=1)
 
         incidentes = []
         for rele_id, itens in leituras_por_rele.items():
             itens.sort(key=lambda x: x[0])
-            tipo_ativo = None
+            identidade_ativa = None
             inicio_ativo = None
-            for ts, tipo_atual in itens:
-                if tipo_ativo is None:
-                    if tipo_atual:
-                        tipo_ativo = tipo_atual
+            for ts, identidade_atual in itens:
+                if identidade_ativa is None:
+                    if identidade_atual:
+                        identidade_ativa = identidade_atual
                         inicio_ativo = ts
                     continue
-                if tipo_atual == tipo_ativo:
+                if identidade_atual == identidade_ativa:
                     continue
+                tipo_ativo, parametros_ativo = identidade_ativa
                 incidentes.append(self._novo_incidente(
-                    base_key=f"{usina_id}:{rele_id}:{tipo_ativo}",
+                    base_key=_chave_evento_rele(usina_id, rele_id, tipo_ativo, parametros_ativo),
                     natureza="RELE",
                     tipo_falha=tipo_ativo,
                     usina_id=usina_id,
@@ -1948,12 +2047,13 @@ class MonitorService:
                     inicio_ts=(inicio_ativo or ts),
                     fim_ts=ts.isoformat(),
                 ))
-                tipo_ativo = tipo_atual
-                inicio_ativo = ts if tipo_atual else None
+                identidade_ativa = identidade_atual
+                inicio_ativo = ts if identidade_atual else None
 
-            if tipo_ativo:
+            if identidade_ativa:
+                tipo_ativo, parametros_ativo = identidade_ativa
                 incidentes.append(self._novo_incidente(
-                    base_key=f"{usina_id}:{rele_id}:{tipo_ativo}",
+                    base_key=_chave_evento_rele(usina_id, rele_id, tipo_ativo, parametros_ativo),
                     natureza="RELE",
                     tipo_falha=tipo_ativo,
                     usina_id=usina_id,
@@ -2359,6 +2459,226 @@ class MonitorService:
         )
         return True
 
+    def _coletar_alertas_rele_usina(
+        self,
+        *,
+        usina_id: str,
+        nome: str | None,
+        inicio_padrao: datetime,
+        agora: datetime,
+    ) -> tuple[list, bool, datetime | None]:
+        last_usina = self.ultima_varredura_rele_por_usina.get(usina_id)
+        if last_usina:
+            inicio_janela = last_usina + timedelta(seconds=WINDOW_DELTA_SECONDS)
+        else:
+            inicio_janela = inicio_padrao
+
+        alertas, tem_dados, teve_timeout, max_ts_rele = detectar_alertas_rele(
+            self.api_rele, usina_id, inicio_janela, agora
+        )
+        if not tem_dados:
+            motivo = "TIMEOUT" if teve_timeout else "SEM_DADOS"
+            logger_rele.warning(f"Sem dados de relé em {nome} (motivo: {motivo}). Mantendo alertas ativos.")
+            return [], True, max_ts_rele
+        if teve_timeout:
+            logger_rele.warning(
+                f"Dados parciais de relé em {nome} (motivo: TIMEOUT_PARCIAL). Mantendo alertas ativos."
+            )
+            return [], True, max_ts_rele
+        return alertas, False, max_ts_rele
+
+    def _montar_alerta_rele_formatado(
+        self,
+        alerta_raw: dict,
+        *,
+        base: str,
+        nome: str | None,
+        capacidade,
+    ) -> dict:
+        ts_first = alerta_raw.get("ts_primeiro", alerta_raw["ts_leitura"])
+        ts_last = alerta_raw.get("ts_ultimo", alerta_raw["ts_leitura"])
+        intervalo_txt = self.formatar_intervalo_alerta(ts_first, ts_last)
+        parametros = alerta_raw["parametros"]
+        return {
+            "base": base,
+            "usina": nome,
+            "capacidade": capacidade,
+            "rele": alerta_raw["rele_id"],
+            "horario": alerta_raw["ts_leitura"].strftime("%d/%m/%Y %H:%M:%S"),
+            "tipo": alerta_raw["tipo_alerta"],
+            "ts_iso": alerta_raw["ts_leitura"].isoformat(),
+            "parametros": f"{parametros} | {intervalo_txt}" if intervalo_txt else parametros,
+        }
+
+    def _registrar_alerta_rele_detectado(
+        self,
+        *,
+        alerta_raw: dict,
+        usina_id: str,
+        nome: str | None,
+        capacidade,
+        pend_norm: dict,
+        bases_ativos_atual: set,
+        novos_por_usina: dict,
+        agora: datetime,
+    ) -> None:
+        parametros_base = alerta_raw.get("parametros_chave") or alerta_raw.get("parametros", "")
+        base = _chave_evento_rele(usina_id, alerta_raw["rele_id"], alerta_raw["tipo_alerta"], parametros_base)
+        bases_legadas = {
+            f"{usina_id}:{alerta_raw['rele_id']}:{alerta_raw['tipo_alerta']}",
+            _chave_legada_rele(usina_id, alerta_raw["rele_id"], alerta_raw["tipo_alerta"]),
+        }
+        for base_legada in bases_legadas:
+            self._migrar_chave_rele_ativa(base_legada, base)
+
+        pend_list = pend_norm.get(usina_id, [])
+        if pend_list:
+            pend_norm[usina_id] = [
+                i for i in pend_list if i.get("base") not in ({base} | bases_legadas)
+            ]
+            if not pend_norm[usina_id]:
+                pend_norm.pop(usina_id, None)
+
+        bases_ativos_atual.add(base)
+        alerta_fmt = self._montar_alerta_rele_formatado(
+            alerta_raw,
+            base=base,
+            nome=nome,
+            capacidade=capacidade,
+        )
+
+        is_novo = base not in self.rele_alertas_ativos
+        self._ativar_alerta_rele(
+            base, alerta_fmt,
+            usina_id=usina_id,
+            nome=nome,
+            rele_id=alerta_raw["rele_id"],
+            tipo_alerta=alerta_raw["tipo_alerta"],
+            inicio_ts=alerta_raw["ts_leitura"],
+        )
+        if base in self.rele_notificados:
+            logger_rele.info(
+                f"[RELE] Duplicidade suprimida | base={base} | "
+                f"usina={nome} | rele={alerta_raw['rele_id']} | tipo={alerta_raw['tipo_alerta']} | "
+                f"parametros={parametros_base}"
+            )
+        elif not is_novo and self._retry_rele_adiado(base, agora):
+            retry_after = self.rele_notificacao_retry_after.get(base)
+            logger_rele.info(
+                f"[RELE] Retry de alerta pendente adiado | base={base} | "
+                f"retry_after={retry_after} | usina={nome} | rele={alerta_raw['rele_id']} | "
+                f"tipo={alerta_raw['tipo_alerta']} | parametros={parametros_base}"
+            )
+        else:
+            novos_por_usina.setdefault(
+                usina_id, {"usina": nome, "capacidade": capacidade, "itens": []}
+            )["itens"].append(alerta_fmt)
+            logger_rele.info(
+                f"[RELE] Alerta novo/pendente marcado para envio | base={base} | "
+                f"usina={nome} | rele={alerta_raw['rele_id']} | tipo={alerta_raw['tipo_alerta']} | "
+                f"parametros={parametros_base}"
+            )
+
+    def _registrar_resolucoes_rele(self, bases_ativos_atual: set, agora: datetime) -> dict:
+        resolvidos_por_usina = {}
+        resolved = self.rele_alertas_ativos - bases_ativos_atual
+        for base in resolved:
+            alerta_antigo = self._resolver_alerta_rele(base, fim_ts=agora)
+            if alerta_antigo:
+                usina_id, rele_id, tipo, _ = _partes_chave_rele(base)
+                resolvidos_por_usina.setdefault(
+                    usina_id, {"usina": alerta_antigo.get("usina"), "capacidade": alerta_antigo.get("capacidade"), "itens": []}
+                )["itens"].append(
+                    {
+                        "base": base,
+                        "usina": alerta_antigo.get("usina"),
+                        "capacidade": alerta_antigo.get("capacidade"),
+                        "rele": alerta_antigo.get("rele", rele_id),
+                        "tipo": alerta_antigo.get("tipo", tipo),
+                        "horario": alerta_antigo.get("horario"),
+                        "ts_iso": alerta_antigo.get("ts_iso"),
+                        "parametros": alerta_antigo.get("parametros"),
+                    }
+                )
+        return resolvidos_por_usina
+
+    def _montar_jobs_notificacao_rele(
+        self,
+        novos_por_usina: dict,
+        resolvidos_por_usina: dict,
+        pend_norm: dict,
+    ) -> list:
+        notification_jobs = []
+        usinas = set(novos_por_usina.keys()) | set(resolvidos_por_usina.keys()) | set(pend_norm.keys())
+        for usina_id in usinas:
+            pacote = {"usina": None, "capacidade": None, "novos": [], "normalizados": []}
+            if usina_id in novos_por_usina:
+                pacote["usina"] = novos_por_usina[usina_id].get("usina")
+                pacote["capacidade"] = novos_por_usina[usina_id].get("capacidade")
+                pacote["novos"] = novos_por_usina[usina_id].get("itens", [])
+            if usina_id in resolvidos_por_usina:
+                pacote["usina"] = pacote["usina"] or resolvidos_por_usina[usina_id].get("usina")
+                pacote["capacidade"] = pacote["capacidade"] or resolvidos_por_usina[usina_id].get("capacidade")
+                pacote["normalizados"] = resolvidos_por_usina[usina_id].get("itens", [])
+            pend_itens = pend_norm.get(usina_id, [])
+            if pend_itens:
+                pacote["normalizados"].extend(pend_itens)
+                if not pacote["usina"]:
+                    pacote["usina"] = pend_itens[0].get("usina")
+                    pacote["capacidade"] = pend_itens[0].get("capacidade")
+
+            pacote["novos"] = _dedupe_por_base(pacote["novos"])
+            pacote["normalizados"] = _dedupe_por_base(pacote["normalizados"])
+            pacote["novos"] = sorted(pacote["novos"], key=_alerta_ts_key)
+            pacote["normalizados"] = sorted(pacote["normalizados"], key=_alerta_ts_key)
+            if not pacote["novos"] and not pacote["normalizados"]:
+                continue
+
+            if pacote["normalizados"]:
+                pend_list = pend_norm.setdefault(usina_id, [])
+                existentes = {i.get("base") for i in pend_list if i.get("base")}
+                for item in pacote["normalizados"]:
+                    base = item.get("base")
+                    if base and base in existentes:
+                        continue
+                    pend_list.append(item)
+                    if base:
+                        existentes.add(base)
+            notification_jobs.append((usina_id, pacote))
+        return notification_jobs
+
+    def _aplicar_resultados_notificacao_rele(self, job_results: dict) -> None:
+        if not job_results:
+            return
+        with self._scan_lock:
+            pend_norm = self.pending_notifications.setdefault("rele_normalizados", {})
+            for usina_id, (ok_novos, ok_norm, pacote) in job_results.items():
+                if ok_novos:
+                    for item in pacote["novos"]:
+                        base = item.get("base")
+                        if base:
+                            self.rele_notificados.add(base)
+                            self.rele_notificacao_retry_after.pop(base, None)
+                elif pacote.get("novos"):
+                    agora_retry = datetime.now()
+                    bases_falha = [item.get("base") for item in pacote["novos"] if item.get("base")]
+                    for base in bases_falha:
+                        self._agendar_retry_rele(base, agora_retry)
+                    logger_rele.warning(
+                        f"[RELE] Falha ao enviar alerta; evento permanece pendente para retry controlado | "
+                        f"usina_id={usina_id} | bases={bases_falha} | "
+                        f"retry_after={(agora_retry + RELAY_NOTIFICATION_RETRY_COOLDOWN).isoformat()}"
+                    )
+                if ok_norm:
+                    bases_norm = {item.get("base") for item in pacote["normalizados"] if item.get("base")}
+                    if bases_norm and usina_id in pend_norm:
+                        pend_norm[usina_id] = [
+                            i for i in pend_norm.get(usina_id, []) if i.get("base") not in bases_norm
+                        ]
+                        if not pend_norm[usina_id]:
+                            pend_norm.pop(usina_id, None)
+            self._save_state()
+
     # Busca alertas de rele nas usinas e dispara notificacoes unicas por evento.
     def executar_varredura_rele(self):
         with self._scan_lock:
@@ -2385,7 +2705,6 @@ class MonitorService:
 
             bases_ativos_atual = set()
             novos_por_usina = {}
-            resolvidos_por_usina = {}
             usinas_sem_dados = set(ausentes_rele)
 
             for p in plantas:
@@ -2401,60 +2720,27 @@ class MonitorService:
                 nome = p.get("nome")
                 cap = p.get("capacidade")
 
-                last_usina = self.ultima_varredura_rele_por_usina.get(usina_id)
-                if last_usina:
-                    inicio_janela = last_usina + timedelta(seconds=WINDOW_DELTA_SECONDS)
-                else:
-                    inicio_janela = inicio_padrao
-
-                alertas, tem_dados, teve_timeout, max_ts_rele = detectar_alertas_rele(self.api_rele, usina_id, inicio_janela, agora)
-                if not tem_dados:
-                    motivo = "TIMEOUT" if teve_timeout else "SEM_DADOS"
-                    logger_rele.warning(f"Sem dados de relé em {nome} (motivo: {motivo}). Mantendo alertas ativos.")
-                    usinas_sem_dados.add(usina_id)
-                    continue
-                if teve_timeout:
-                    logger_rele.warning(
-                        f"Dados parciais de relé em {nome} (motivo: TIMEOUT_PARCIAL). Mantendo alertas ativos."
-                    )
+                alertas, preservar_ativos, max_ts_rele = self._coletar_alertas_rele_usina(
+                    usina_id=usina_id,
+                    nome=nome,
+                    inicio_padrao=inicio_padrao,
+                    agora=agora,
+                )
+                if preservar_ativos:
                     usinas_sem_dados.add(usina_id)
                     continue
 
                 for a in alertas:
-                    base = f"{usina_id}:{a['rele_id']}:{a['tipo_alerta']}"
-                    pend_list = pend_norm.get(usina_id, [])
-                    if pend_list:
-                        pend_norm[usina_id] = [i for i in pend_list if i.get("base") != base]
-                        if not pend_norm[usina_id]:
-                            pend_norm.pop(usina_id, None)
-                    bases_ativos_atual.add(base)
-                    ts_first = a.get("ts_primeiro", a["ts_leitura"])
-                    ts_last = a.get("ts_ultimo", a["ts_leitura"])
-                    intervalo_txt = self.formatar_intervalo_alerta(ts_first, ts_last)
-                    alerta_fmt = {
-                        "base": base,
-                        "usina": nome,
-                        "capacidade": cap,
-                        "rele": a["rele_id"],
-                        "horario": a["ts_leitura"].strftime("%d/%m/%Y %H:%M:%S"),
-                        "tipo": a["tipo_alerta"],
-                        "ts_iso": a["ts_leitura"].isoformat(),
-                        "parametros": f"{a['parametros']} | {intervalo_txt}" if intervalo_txt else a["parametros"],
-                    }
-
-                    is_novo = base not in self.rele_alertas_ativos
-                    self._ativar_alerta_rele(
-                        base, alerta_fmt,
+                    self._registrar_alerta_rele_detectado(
+                        alerta_raw=a,
                         usina_id=usina_id,
                         nome=nome,
-                        rele_id=a["rele_id"],
-                        tipo_alerta=a["tipo_alerta"],
-                        inicio_ts=a["ts_leitura"],
+                        capacidade=cap,
+                        pend_norm=pend_norm,
+                        bases_ativos_atual=bases_ativos_atual,
+                        novos_por_usina=novos_por_usina,
+                        agora=agora,
                     )
-                    if is_novo or base not in self.rele_notificados:
-                        novos_por_usina.setdefault(
-                            usina_id, {"usina": nome, "capacidade": cap, "itens": []}
-                        )["itens"].append(alerta_fmt)
 
                 if max_ts_rele is not None:
                     self.ultima_varredura_rele_por_usina[usina_id] = max_ts_rele
@@ -2463,66 +2749,16 @@ class MonitorService:
                 for base in self.rele_alertas_ativos:
                     if base.split(":", 1)[0] in usinas_sem_dados:
                         bases_ativos_atual.add(base)
-            resolved = self.rele_alertas_ativos - bases_ativos_atual
-            for base in resolved:
-                alerta_antigo = self._resolver_alerta_rele(base, fim_ts=agora)
-                if alerta_antigo:
-                    usina_id, rele_id, tipo = base.split(":", 2)
-                    resolvidos_por_usina.setdefault(
-                        usina_id, {"usina": alerta_antigo.get("usina"), "capacidade": alerta_antigo.get("capacidade"), "itens": []}
-                    )["itens"].append(
-                        {
-                            "base": base,
-                            "usina": alerta_antigo.get("usina"),
-                            "capacidade": alerta_antigo.get("capacidade"),
-                            "rele": alerta_antigo.get("rele", rele_id),
-                            "tipo": alerta_antigo.get("tipo", tipo),
-                            "horario": alerta_antigo.get("horario"),
-                            "ts_iso": alerta_antigo.get("ts_iso"),
-                            "parametros": alerta_antigo.get("parametros"),
-                        }
-                    )
+            resolvidos_por_usina = self._registrar_resolucoes_rele(bases_ativos_atual, agora)
             # recalcula usinas com rele ativo a partir do conjunto de alertas ativos
             self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
 
             # envia uma notificação por usina consolidando alertas novos, normalizados e pendentes
-            notification_jobs = []
-            usinas = set(novos_por_usina.keys()) | set(resolvidos_por_usina.keys()) | set(pend_norm.keys())
-            for usina_id in usinas:
-                pacote = {"usina": None, "capacidade": None, "novos": [], "normalizados": []}
-                if usina_id in novos_por_usina:
-                    pacote["usina"] = novos_por_usina[usina_id].get("usina")
-                    pacote["capacidade"] = novos_por_usina[usina_id].get("capacidade")
-                    pacote["novos"] = novos_por_usina[usina_id].get("itens", [])
-                if usina_id in resolvidos_por_usina:
-                    pacote["usina"] = pacote["usina"] or resolvidos_por_usina[usina_id].get("usina")
-                    pacote["capacidade"] = pacote["capacidade"] or resolvidos_por_usina[usina_id].get("capacidade")
-                    pacote["normalizados"] = resolvidos_por_usina[usina_id].get("itens", [])
-                pend_itens = pend_norm.get(usina_id, [])
-                if pend_itens:
-                    pacote["normalizados"].extend(pend_itens)
-                    if not pacote["usina"]:
-                        pacote["usina"] = pend_itens[0].get("usina")
-                        pacote["capacidade"] = pend_itens[0].get("capacidade")
-
-                pacote["novos"] = _dedupe_por_base(pacote["novos"])
-                pacote["normalizados"] = _dedupe_por_base(pacote["normalizados"])
-                pacote["novos"] = sorted(pacote["novos"], key=_alerta_ts_key)
-                pacote["normalizados"] = sorted(pacote["normalizados"], key=_alerta_ts_key)
-                if not pacote["novos"] and not pacote["normalizados"]:
-                    continue
-
-                if pacote["normalizados"]:
-                    pend_list = pend_norm.setdefault(usina_id, [])
-                    existentes = {i.get("base") for i in pend_list if i.get("base")}
-                    for item in pacote["normalizados"]:
-                        base = item.get("base")
-                        if base and base in existentes:
-                            continue
-                        pend_list.append(item)
-                        if base:
-                            existentes.add(base)
-                notification_jobs.append((usina_id, pacote))
+            notification_jobs = self._montar_jobs_notificacao_rele(
+                novos_por_usina=novos_por_usina,
+                resolvidos_por_usina=resolvidos_por_usina,
+                pend_norm=pend_norm,
+            )
 
             if not sem_plantas:
                 self.ultima_varredura_rele = agora
@@ -2535,24 +2771,7 @@ class MonitorService:
             ok_novos, ok_norm = self._notificar_rele_agrupado(pacote)
             job_results[usina_id] = (ok_novos, ok_norm, pacote)
 
-        if job_results:
-            with self._scan_lock:
-                pend_norm = self.pending_notifications.setdefault("rele_normalizados", {})
-                for usina_id, (ok_novos, ok_norm, pacote) in job_results.items():
-                    if ok_novos:
-                        for item in pacote["novos"]:
-                            base = item.get("base")
-                            if base:
-                                self.rele_notificados.add(base)
-                    if ok_norm:
-                        bases_norm = {item.get("base") for item in pacote["normalizados"] if item.get("base")}
-                        if bases_norm and usina_id in pend_norm:
-                            pend_norm[usina_id] = [
-                                i for i in pend_norm.get(usina_id, []) if i.get("base") not in bases_norm
-                            ]
-                            if not pend_norm[usina_id]:
-                                pend_norm.pop(usina_id, None)
-                self._save_state()
+        self._aplicar_resultados_notificacao_rele(job_results)
 
         logger_rele.info("[SCAN] Varredura rele fase lock/API concluida em %.1fs", lock_api_duration)
         logger_rele.info("Varredura de rele concluida.")
@@ -2882,7 +3101,7 @@ class MonitorService:
             )
             if card:
                 try:
-                    ok_novos = _teams_post_card(**card)
+                    ok_novos = _teams_post_card(**card, max_tentativas=1)
                 except Exception:
                     logger_rele.exception("Falha ao notificar Teams (rele falha)")
                     ok_novos = False
@@ -2896,7 +3115,7 @@ class MonitorService:
             )
             if card:
                 try:
-                    ok_norm = _teams_post_card(**card)
+                    ok_norm = _teams_post_card(**card, max_tentativas=1)
                 except Exception:
                     logger_rele.exception("Falha ao notificar Teams (rele normalizacao)")
                     ok_norm = False

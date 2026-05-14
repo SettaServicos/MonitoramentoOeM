@@ -1,9 +1,9 @@
-"""
-Monitor de Relés/Inversores executando como daemon (processo único).
+﻿"""
+Monitor de RelÃ©s/Inversores executando como daemon (processo Ãºnico).
 
-Mantém a mesma lógica de detecção do main.py original, porém estruturado
-para rodar como serviço de longa duração, sem depender de cron e evitando
-instâncias sobrepostas.
+MantÃ©m a mesma lÃ³gica de detecÃ§Ã£o do main.py original, porÃ©m estruturado
+para rodar como serviÃ§o de longa duraÃ§Ã£o, sem depender de cron e evitando
+instÃ¢ncias sobrepostas.
 """
 
 import os
@@ -20,30 +20,24 @@ from requests.exceptions import Timeout
 import requests
 import re
 
-# --- Configuração geral ---
+# --- ConfiguraÃ§Ã£o geral ---
 RELAY_INTERVAL = 600          # 10 min
 INVERTER_INTERVAL = 900       # 15 min
-BASE_URL = "https://apipv.pvoperation.com.br/api/v1"
 
-# Pergunta direta para quem for configurar: qual é o usuário da API?
-# Exemplo para preencher: monitoramento@empresa.com
-EMAIL = os.environ.get("MONITOR_EMAIL", "monitoramento@settaenergia.com.br").strip()
+# Configuracao via ambiente, espelhando o main.py.
+PVOP_BASE_URL = os.environ.get("PVOP_BASE_URL", "https://apipv.pvoperation.com.br/api/v1").strip()
+PVOP_EMAIL = os.environ.get("MONITOR_EMAIL", "").strip()
+PVOP_PASSWORD = os.environ.get("MONITOR_PASSWORD", "").strip()
+TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "").strip()
+TEAMS_ENABLED = bool(TEAMS_WEBHOOK_URL)
 
-# Pergunta direta para quem for configurar: qual é a senha da API?
-# Exemplo para preencher: senha-super-secreta
-PASSWORD = os.environ.get("MONITOR_PASSWORD", "$$Setta1324").strip()
-
-# Teams
-TEAMS_WEBHOOK_URL = os.environ.get(
-    "TEAMS_WEBHOOK_URL",
-    # Pergunta direta: qual é a URL do Webhook do Teams para receber os alertas?
-    # Exemplo para preencher (substitua pelo do seu canal):
-    "https://settaenergiarecife.webhook.office.com/webhookb2/ff6efec5-9ceb-4932-89ba-d4d8082a1975@77b21bc1-b0b7-4df6-9225-2e24fc9de0f6/IncomingWebhook/38f7efca2b124a17abc7dcc8a5a40c95/a29266d7-870f-4855-96b0-c21a4710f37b/V2rB2XbXOgznVTxAoIWIeDPnlRZ203j0jsNsLKr4cNK141",
-).strip()
-TEAMS_ENABLED = bool(TEAMS_WEBHOOK_URL) and "settaenergiarecife.webhook.office.com" not in TEAMS_WEBHOOK_URL.lower()
+# Aliases mantidos para compatibilidade com usos externos antigos do modulo.
+BASE_URL = PVOP_BASE_URL
+EMAIL = PVOP_EMAIL
+PASSWORD = PVOP_PASSWORD
 
 # SSL
-# Pergunta direta: onde está o bundle de certificados CA do servidor?
+# Pergunta direta: onde estÃ¡ o bundle de certificados CA do servidor?
 # Exemplos para preencher: /etc/ssl/certs/ca-bundle.crt (Linux) ou C:\\certs\\ca.pem (Windows)
 SSL_BUNDLE = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or ""
 VERIFY_CA = SSL_BUNDLE if SSL_BUNDLE else True
@@ -55,6 +49,14 @@ LOCK_FILE = BASE_DIR / ".monitor_lock"
 
 WINDOW_DELTA_SECONDS = 1
 
+# Apenas estas usinas possuem relÃ© de proteÃ§Ã£o e devem ser varridas no fluxo de relÃ©.
+RELE_PLANT_IDS = {
+    "19478", "19815", "19816", "21544", "22275", "22283", "22290", "22291",
+    "22873", "22874", "24129", "24130", "53209", "53222", "53297", "59991",
+    "60003", "60559", "297443", "297444", "297445", "297446", "297449",
+    "18744051", "18744052",
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -62,13 +64,29 @@ logging.basicConfig(
 logger = logging.getLogger("RelayMonitorDaemon")
 
 
-def _require_config(name: str, value: str, example: str):
-    """Falha cedo se ainda estiver usando placeholder, para evitar rodar sem credencial real."""
-    if not value:
-        raise SystemExit(f"Configuração obrigatória ausente: {name}. Exemplo: {example}")
-    lower_v = value.lower()
-    if "exemplo" in lower_v or "senha-super-secreta" in lower_v or value == example:
-        raise SystemExit(f"Substitua o placeholder de {name}. Exemplo: {example}")
+def _is_placeholder(value: str) -> bool:
+    if value is None:
+        return True
+    raw = str(value).strip()
+    return (not raw) or (raw.upper() == "COLE_AQUI")
+
+
+def validate_config():
+    missing = []
+    if _is_placeholder(PVOP_BASE_URL):
+        missing.append("PVOP_BASE_URL")
+    if _is_placeholder(PVOP_EMAIL):
+        missing.append("MONITOR_EMAIL")
+    if _is_placeholder(PVOP_PASSWORD):
+        missing.append("MONITOR_PASSWORD")
+    if _is_placeholder(TEAMS_WEBHOOK_URL):
+        missing.append("TEAMS_WEBHOOK_URL")
+    if missing:
+        raise SystemExit(
+            "Configuracao obrigatoria ausente ou placeholder em variaveis de ambiente: "
+            + ", ".join(missing)
+            + ". Configure o ambiente do servico ou crie um .env local nao versionado."
+        )
 
 
 def _teams_post_card(title, text, severity="info", facts=None):
@@ -98,7 +116,7 @@ def _teams_post_card(title, text, severity="info", facts=None):
 
 
 class PVOperationAPI:
-    def __init__(self, email, password, base_url=BASE_URL, verify=VERIFY_CA):
+    def __init__(self, email, password, base_url=PVOP_BASE_URL, verify=VERIFY_CA):
         self.email = email
         self.password = password
         self.base_url = base_url
@@ -118,9 +136,9 @@ class PVOperationAPI:
             if resp.status_code == 200:
                 self.token = resp.json().get("token")
                 self.headers = {"x-access-token": self.token}
-                logger.info("Autenticação realizada com sucesso.")
+                logger.info("AutenticaÃ§Ã£o realizada com sucesso.")
                 return True
-            logger.error(f"Falha na autenticação. Status: {resp.status_code}")
+            logger.error(f"Falha na autenticaÃ§Ã£o. Status: {resp.status_code}")
             return False
         except Exception as e:
             logger.error(f"Erro durante login: {e}")
@@ -130,7 +148,7 @@ class PVOperationAPI:
         logger.warning("Tentando renovar token...")
         ok = self._login()
         if not ok:
-            logger.error("Não foi possível renovar o token.")
+            logger.error("NÃ£o foi possÃ­vel renovar o token.")
         return ok
 
     def get_plants(self):
@@ -145,7 +163,7 @@ class PVOperationAPI:
                 return r.json() or []
             logger.error(f"Erro ao buscar plantas. Status: {r.status_code}")
         except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
-            logger.warning(f"Erro de conexão em get_plants: {e}. Tentando recriar sessão e reautenticar.")
+            logger.warning(f"Erro de conexÃ£o em get_plants: {e}. Tentando recriar sessÃ£o e reautenticar.")
             try:
                 self.session.close()
             except Exception:
@@ -158,9 +176,9 @@ class PVOperationAPI:
                     if r.status_code == 200:
                         return r.json() or []
                 except Exception as e2:
-                    logger.error(f"Falha ao repetir get_plants após recriar sessão: {e2}")
+                    logger.error(f"Falha ao repetir get_plants apÃ³s recriar sessÃ£o: {e2}")
         except Exception as e:
-            logger.error(f"Exceção em get_plants: {e}")
+            logger.error(f"ExceÃ§Ã£o em get_plants: {e}")
         return []
 
     def post_day(self, endpoint: str, plant_id: int, date: datetime):
@@ -204,25 +222,48 @@ class PVOperationAPI:
         return None, False
 
 
-def extrair_valor_numerico(valor) -> float:
+def extrair_valor_numerico(valor):
+    if isinstance(valor, bool):
+        return float(valor)
     if isinstance(valor, (int, float)):
         return float(valor)
     if isinstance(valor, str):
-        m = re.search(r"([-+]?\d*\.\d+|\d+)", valor)
+        txt = valor.strip()
+        if "," in txt and "." in txt and txt.rfind(",") > txt.rfind("."):
+            txt = txt.replace(".", "").replace(",", ".")
+        elif "," in txt and "." not in txt:
+            txt = txt.replace(",", ".")
+        m = re.search(r"([-+]?\d*\.\d+|\d+)", txt)
         if m:
             try:
                 return float(m.group(1))
             except Exception:
-                return 0.0
-    return 0.0
+                return None
+    return None
+
+
+def _valor_ativo_rele(valor) -> bool:
+    if isinstance(valor, bool):
+        return valor
+    if isinstance(valor, (int, float)):
+        return valor == 1
+    if isinstance(valor, str):
+        txt = valor.strip().lower()
+        if txt in {"true", "1"}:
+            return True
+        try:
+            return float(txt) == 1.0
+        except Exception:
+            return False
+    return False
 
 
 def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, fim: datetime):
     PARAMS_CLASSIF = {
-        "SOBRETENSÃO": {"r59A", "r59B", "r59C", "r59N"},
-        "SUBTENSÃO": {"r27A", "r27B", "r27C", "r27_0"},
-        "FREQUÊNCIA": {"r81O", "r81U"},
-        "TÉRMICO": {"r49", "r49_2"},
+        "SOBRETENSÃƒO": {"r59A", "r59B", "r59C", "r59N"},
+        "SUBTENSÃƒO": {"r27A", "r27B", "r27C", "r27_0"},
+        "FREQUÃŠNCIA": {"r81O", "r81U"},
+        "TÃ‰RMICO": {"r49", "r49_2"},
         "BLOQUEIO": {"rAR", "rBA", "rDO"},
     }
     PARAMETROS_RELE = {
@@ -246,9 +287,6 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
             d += timedelta(days=1)
             continue
 
-        if isinstance(data_resp, list) and len(data_resp) > 0:
-            tem_dados = True
-
         for registro in (data_resp or []):
             conteudo = registro.get("conteudojson", {}) or {}
             idrele = registro.get("idrele")
@@ -260,8 +298,9 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
                 continue
             if not (inicio <= ts <= fim):
                 continue
+            tem_dados = True
 
-            ativos = [p for p in PARAMETROS_RELE if conteudo.get(p) is True]
+            ativos = [p for p in PARAMETROS_RELE if _valor_ativo_rele(conteudo.get(p))]
             if not ativos:
                 continue
 
@@ -285,12 +324,12 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
         return [], tem_dados, teve_timeout
 
     candidatos.sort(key=lambda a: a["ts_leitura"])
-    return [candidatos[0]], tem_dados, teve_timeout
+    return candidatos, tem_dados, teve_timeout
 
 
 def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datetime, fim: datetime, falhas_ativas_previas: dict):
     JANELA_INICIO = dtime(6, 30)
-    JANELA_FIM = dtime(17, 30)
+    JANELA_FIM = dtime(17, 0)
 
     leituras_por_inv = {}
     tem_dados = False
@@ -330,7 +369,10 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
                 continue
 
             pac = extrair_valor_numerico(pac_raw)
-            cond = pac == 0.0
+            if pac is None:
+                leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "cond_ok": False, "sem_dados": True, "pac": None})
+                continue
+            cond = pac <= 0
             leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "cond_ok": cond, "sem_dados": False, "pac": pac})
             tem_dados = True
         d += timedelta(days=1)
@@ -345,21 +387,19 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
         lst.sort(key=lambda x: x["ts"])
 
         state_key = f"{plant_id}:{inv_id}"
-        prev_state = falhas_ativas_previas.get(state_key, {"ativa": False, "rec_seq": 0})
+        prev_state = falhas_ativas_previas.get(state_key, {"ativa": False, "rec_seq": 0, "seq_zero": 0})
         if isinstance(prev_state, bool):
-            prev_state = {"ativa": prev_state, "rec_seq": 0}
+            prev_state = {"ativa": prev_state, "rec_seq": 0, "seq_zero": 0}
         ativa = bool(prev_state.get("ativa", False))
         rec_seq = int(prev_state.get("rec_seq", 0))
-        seq_zero = 0
+        seq_zero = int(prev_state.get("seq_zero", 0))
 
         for item in lst:
             ts = item["ts"]
             if item["sem_dados"]:
-                seq_zero = 0
-                rec_seq = 0
                 continue
 
-            pac_zero = item["cond_ok"]  # True se potência == 0.0
+            pac_zero = item["cond_ok"]  # True se potÃªncia == 0.0
             if pac_zero:
                 seq_zero = seq_zero + 1
                 rec_seq = 0
@@ -373,13 +413,13 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
                         "inversor_id": str(inv_id),
                         "ts_leitura": ts,
                         "status": "FALHA",
-                        "indicadores": {"pac": 0.0},
+                        "indicadores": {"pac": item.get("pac", 0.0)},
                     }
                 )
                 ativa = True
                 rec_seq = 0
 
-            if ativa and rec_seq >= 3:
+            if ativa and rec_seq >= 2:
                 recuperados.append(
                     {
                         "inversor_id": str(inv_id),
@@ -391,13 +431,13 @@ def detectar_falhas_inversores(api: PVOperationAPI, plant_id: str, inicio: datet
                 ativa = False
                 rec_seq = 0
 
-        falhas_ativas[state_key] = {"ativa": ativa, "rec_seq": rec_seq}
+        falhas_ativas[state_key] = {"ativa": ativa, "rec_seq": rec_seq, "seq_zero": seq_zero}
 
     return falhas, recuperados, tem_dados, falhas_ativas, teve_timeout
 
 
 class PIDFileLock:
-    """Lock de instância única com arquivo, compatível com Windows e Unix."""
+    """Lock de instÃ¢ncia Ãºnica com arquivo, compatÃ­vel com Windows e Unix."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -435,7 +475,7 @@ class PIDFileLock:
 
 
 class MonitorDaemon:
-    """Processo único com duas threads de varredura; pronto para rodar como serviço."""
+    """Processo Ãºnico com duas threads de varredura; pronto para rodar como serviÃ§o."""
 
     def __init__(self, api: PVOperationAPI):
         self.api = api
@@ -462,7 +502,7 @@ class MonitorDaemon:
         ]
         for t in self._threads:
             t.start()
-        logger.info("Monitor daemon iniciado (threads de relé e inversor ativas).")
+        logger.info("Monitor daemon iniciado (threads de relÃ© e inversor ativas).")
 
     def stop(self):
         self.stop_event.set()
@@ -499,7 +539,7 @@ class MonitorDaemon:
             self.falhas_ativas_por_inv = data.get("falhas_ativas_por_inv", {})
             logger.info("Estado carregado do disco.")
         except Exception as e:
-            logger.warning(f"Não foi possível carregar estado salvo: {e}")
+            logger.warning(f"NÃ£o foi possÃ­vel carregar estado salvo: {e}")
 
     def _save_state(self):
         try:
@@ -522,7 +562,7 @@ class MonitorDaemon:
             try:
                 self.executar_varredura_rele()
             except Exception:
-                logger.exception("Erro na varredura de relé")
+                logger.exception("Erro na varredura de relÃ©")
             self.stop_event.wait(RELAY_INTERVAL)
 
     def _loop_inversor(self):
@@ -539,19 +579,27 @@ class MonitorDaemon:
             inicio_janela = self.ultima_varredura_rele + timedelta(seconds=WINDOW_DELTA_SECONDS)
         else:
             inicio_janela = datetime.combine(agora.date(), datetime.min.time())
-        logger.info("Varredura de relé iniciada.")
+        logger.info("Varredura de relÃ© iniciada.")
 
         plantas = self.api.get_plants()
         if not plantas:
-            logger.warning("Nenhuma usina encontrada (relé).")
+            logger.warning("Nenhuma usina encontrada (relÃ©).")
             self.usinas_alerta_rele_recente = set()
             return
+
+        ids_retornados = {str(p.get("id")) for p in plantas}
+        usinas_com_rele_ativo = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
+        ausentes = usinas_com_rele_ativo - ids_retornados
+        if ausentes:
+            logger.warning(f"Lista parcial de usinas (rele); ausentes: {sorted(ausentes)}")
 
         usinas_com_alerta_rele = set()
         bases_ativos_atual = set()
 
         for p in plantas:
             usina_id = str(p.get("id"))
+            if usina_id not in RELE_PLANT_IDS:
+                continue
             nome = p.get("nome")
             cap = p.get("capacidade")
 
@@ -582,14 +630,15 @@ class MonitorDaemon:
                     self._notificar_rele(alerta_fmt)
 
         self.usinas_alerta_rele_recente = usinas_com_alerta_rele
-        resolved = self.rele_alertas_ativos - bases_ativos_atual
+        resolved = {b for b in (self.rele_alertas_ativos - bases_ativos_atual)
+                    if b.split(":", 1)[0] in ids_retornados}
         for base in resolved:
             self.rele_alertas_ativos.discard(base)
             self.rele_alerta_chave.pop(base, None)
             self.rele_notificados.discard(base)
 
         self.ultima_varredura_rele = agora
-        logger.info("Varredura de relé concluída.")
+        logger.info("Varredura de relÃ© concluÃ­da.")
 
     def executar_varredura_inversor(self):
         agora = datetime.now()
@@ -604,14 +653,17 @@ class MonitorDaemon:
             logger.warning("Nenhuma usina encontrada (inversor).")
             return
 
+        ids_retornados_inv = {str(p.get("id")) for p in plantas}
+        usinas_esperadas_inv = {k.split(":", 1)[0] for k in self.falhas_ativas_por_inv}
+        ausentes_inv = usinas_esperadas_inv - ids_retornados_inv
+        if ausentes_inv:
+            logger.warning(f"Lista parcial de usinas (inversor); ausentes: {sorted(ausentes_inv)}")
+
         for p in plantas:
             usina_id = str(p.get("id"))
             if usina_id in self.usinas_alerta_rele_recente:
-                logger.info(f"Pulando inversores de {p.get('nome')} devido a alerta de relé recente.")
-                for k in list(self.falhas_ativas_por_inv.keys()):
-                    if k.startswith(f"{usina_id}:"):
-                        del self.falhas_ativas_por_inv[k]
-                continue
+                logger.info(f"Pulando inversores de {p.get('nome')} devido a alerta de relÃ© recente.")
+                continue  # preserva falhas_ativas_por_inv; nÃ£o limpa estado
 
             nome = p.get("nome")
             cap = p.get("capacidade")
@@ -660,39 +712,39 @@ class MonitorDaemon:
                     self._notificar_inversor(alerta)
 
         self.ultima_varredura_inversor = agora
-        logger.info("Varredura de inversor concluída.")
+        logger.info("Varredura de inversor concluÃ­da.")
 
     @staticmethod
     def formatar_intervalo_alerta(ts_first, ts_last) -> str:
         if not ts_first or not ts_last:
             return ""
         if ts_first == ts_last:
-            return f"Alerta às {ts_first.strftime('%H:%M')}"
-        return f"Primeiro alerta às {ts_first.strftime('%H:%M')} e último às {ts_last.strftime('%H:%M')}"
+            return f"Alerta Ã s {ts_first.strftime('%H:%M')}"
+        return f"Primeiro alerta Ã s {ts_first.strftime('%H:%M')} e Ãºltimo Ã s {ts_last.strftime('%H:%M')}"
 
     def _notificar_rele(self, alerta):
         msg = (
             f"Usina: {alerta['usina']}\n"
-            f"Relé: {alerta['rele']}\n"
+            f"RelÃ©: {alerta['rele']}\n"
             f"Tipo: {alerta['tipo']}\n"
-            f"Horário: {alerta['horario']}\n"
-            f"Parâmetros: {alerta['parametros']}"
+            f"HorÃ¡rio: {alerta['horario']}\n"
+            f"ParÃ¢metros: {alerta['parametros']}"
         )
-        logger.warning(f"[ALERTA RELÉ] {msg.replace(chr(10), ' | ')}")
+        logger.warning(f"[ALERTA RELÃ‰] {msg.replace(chr(10), ' | ')}")
         try:
             _teams_post_card(
-                title=f"🚨 Alerta de Relé ({alerta['tipo']})",
+                title=f"ðŸš¨ Alerta de RelÃ© ({alerta['tipo']})",
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
-                    f"**Relé:** {alerta['rele']}  \n"
-                    f"**Horário:** {alerta['horario']}  \n"
-                    f"**Parâmetros:** {alerta['parametros']}"
+                    f"**RelÃ©:** {alerta['rele']}  \n"
+                    f"**HorÃ¡rio:** {alerta['horario']}  \n"
+                    f"**ParÃ¢metros:** {alerta['parametros']}"
                 ),
-                severity="danger" if alerta["tipo"] in ("SOBRETENSÃO", "TÉRMICO", "BLOQUEIO") else "warning",
+                severity="danger" if alerta["tipo"] in ("SOBRETENSÃƒO", "TÃ‰RMICO", "BLOQUEIO") else "warning",
                 facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
             )
         except Exception:
-            logger.exception("Falha ao notificar Teams (relé)")
+            logger.exception("Falha ao notificar Teams (relÃ©)")
 
     def _notificar_inversor(self, alerta):
         inds = alerta.get("indicadores", {})
@@ -701,17 +753,17 @@ class MonitorDaemon:
             f"Usina: {alerta['usina']}\n"
             f"Inversor: {alerta['inversor']}\n"
             f"Status: {alerta['status']}\n"
-            f"Horário: {alerta['horario']}\n"
+            f"HorÃ¡rio: {alerta['horario']}\n"
             f"{detalhes_txt}"
         )
         logger.warning(f"[ALERTA INVERSOR] {msg.replace(chr(10), ' | ')}")
         try:
             _teams_post_card(
-                title="🚨 Falha de Inversor (Pac=0; 3 leituras consecutivas; 06:30–17:30)",
+                title="ðŸš¨ Falha de Inversor (PAC<=0; 3 leituras consecutivas; 06:30â€“17:00)",
                 text=(
                     f"**Usina:** {alerta['usina']}  \n"
                     f"**Inversor:** {alerta['inversor']}  \n"
-                    f"**Horário:** {alerta['horario']}  \n"
+                    f"**HorÃ¡rio:** {alerta['horario']}  \n"
                     f"**Detalhes:** {detalhes_txt}"
                 ),
                 severity="danger",
@@ -720,19 +772,44 @@ class MonitorDaemon:
         except Exception:
             logger.exception("Falha ao notificar Teams (inversor)")
 
+    def _notificar_inversor_recuperado(self, alerta):
+        inds = alerta.get("indicadores", {})
+        pac_val = inds.get("pac", "N/A")
+        detalhes_txt = f"Pac: {pac_val}"
+        msg = (
+            f"Usina: {alerta['usina']}\n"
+            f"Inversor: {alerta['inversor']}\n"
+            f"Status: NORMALIZADO\n"
+            f"HorÃ¡rio: {alerta['horario']}\n"
+            f"{detalhes_txt}"
+        )
+        logger.info(f"[RECUPERACAO INVERSOR] {msg.replace(chr(10), ' | ')}")
+        try:
+            _teams_post_card(
+                title="âœ… Inversor Normalizado",
+                text=(
+                    f"**Usina:** {alerta['usina']}  \n"
+                    f"**Inversor:** {alerta['inversor']}  \n"
+                    f"**HorÃ¡rio:** {alerta['horario']}  \n"
+                    f"**Detalhes:** {detalhes_txt}"
+                ),
+                severity="info",
+                facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
+            )
+        except Exception:
+            logger.exception("Falha ao notificar Teams (inversor recuperado)")
+
 
 def run_daemon():
-    _require_config("MONITOR_EMAIL", EMAIL, "monitoramento@empresa.com")
-    _require_config("MONITOR_PASSWORD", PASSWORD, "senha-super-secreta")
-    _require_config("TEAMS_WEBHOOK_URL", TEAMS_WEBHOOK_URL, "https://exemplo.webhook.office.com/xxxxxxxx/IncomingWebhook/xxxxxxxx")
-    api = PVOperationAPI(email=EMAIL, password=PASSWORD)
+    validate_config()
+    api = PVOperationAPI(email=PVOP_EMAIL, password=PVOP_PASSWORD, base_url=PVOP_BASE_URL)
     service = MonitorDaemon(api)
     service.start()
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Encerrando monitor por interrupção do usuário...")
+        logger.info("Encerrando monitor por interrupÃ§Ã£o do usuÃ¡rio...")
     finally:
         service.stop()
         time.sleep(1)
@@ -740,3 +817,4 @@ def run_daemon():
 
 if __name__ == "__main__":
     run_daemon()
+
