@@ -335,7 +335,6 @@ Principais funções extraídas para nível de módulo (testáveis independentem
 |---|---|
 | `detectar_alertas_rele` | Avalia registros de relé e retorna alertas/normalizações |
 | `detectar_falhas_inversores` | Avalia leituras de inversor e retorna falhas/recuperações |
-| `_intervalo_atinge_janela` | Verifica se um intervalo de tempo toca a janela solar |
 | `_montar_alerta_inversor` | Constrói o dict de alerta de inversor (DRY entre `rec` e `falha`) |
 | `_compor_entrada_estado_inversor` | Monta `EstadoInversor` a partir do estado anterior e do novo |
 | `_dedupe_por_base` | Remove alertas de relé duplicados pela chave base |

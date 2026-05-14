@@ -10,7 +10,6 @@
 import atexit
 import json
 import logging
-# Imports principais: bibliotecas nativas e de terceiros usadas em toda a aplicacao.
 import os
 import re
 import signal
@@ -27,7 +26,7 @@ from functools import lru_cache
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from statistics import median
-from typing import Literal, TypedDict
+from typing import Generator, Literal, TypedDict
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import requests
@@ -313,6 +312,10 @@ def _teams_post_card(
                     time.sleep(espera)
                     continue
             r.raise_for_status()
+            resposta_txt = (getattr(r, "text", "") or "").strip()
+            if "Webhook message delivery failed" in resposta_txt:
+                logger.warning(f"[TEAMS] Webhook aceito com falha de entrega: {resposta_txt[:300]}")
+                return False
             return True
         except Exception as e:
             if tentativa == max_tentativas:
@@ -504,7 +507,7 @@ class PVOperationAPI:
         return None
 
     # Faz chamada para endpoint diario (day_*) com retry e backoff exponencial leve.
-    def post_day(self, endpoint: str, plant_id: int, date: datetime) -> tuple:
+    def post_day(self, endpoint: str, plant_id: int, date: datetime) -> tuple[list | None, bool]:
         """Chama endpoints day_* com retry/backoff. Retorna (dados ou None, timeout_flag)."""
         self.last_post_day_timeout = False
         self.last_post_day_error = False
@@ -849,7 +852,7 @@ def _rele_param_ativo(valor) -> bool:
     return False
 
 
-def _iterar_registros_api_dia(data_resp, endpoint: str, plant_id: str, logger_ctx):
+def _iterar_registros_api_dia(data_resp, endpoint: str, plant_id: str, logger_ctx) -> Generator[tuple[dict, dict, datetime], None, None]:
     if not isinstance(data_resp, list):
         logger_ctx.warning(f"Resposta inesperada em {endpoint} (usina {plant_id}): {type(data_resp).__name__}")
         return
@@ -940,19 +943,6 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
     return candidatos, tem_dados, teve_timeout, max_ts_processado
 
 
-def _intervalo_atinge_janela(inicio_dt: datetime, fim_dt: datetime, janela_ini_t: dtime, janela_fim_t: dtime) -> bool:
-    if fim_dt < inicio_dt:
-        return False
-    dia = inicio_dt.date()
-    while dia <= fim_dt.date():
-        janela_ini = datetime.combine(dia, janela_ini_t)
-        janela_fim = datetime.combine(dia, janela_fim_t)
-        if inicio_dt <= janela_fim and fim_dt >= janela_ini:
-            return True
-        dia += timedelta(days=1)
-    return False
-
-
 def _horario_esta_na_janela(referencia: datetime, janela_ini_t: dtime, janela_fim_t: dtime) -> bool:
     return janela_ini_t <= referencia.time() <= janela_fim_t
 
@@ -983,8 +973,7 @@ def detectar_falhas_inversores(
             d += timedelta(days=1)
             continue
         if not isinstance(data_resp, list):
-            for _ in _iterar_registros_api_dia(data_resp, "day_inverter", plant_id, logger_inv):
-                pass
+            logger_inv.warning(f"Resposta inesperada em day_inverter (usina {plant_id}): {type(data_resp).__name__}")
             d += timedelta(days=1)
             continue
         tem_resposta = True
@@ -1123,6 +1112,37 @@ def _plant_ids_retornados(plantas):
         except (TypeError, ValueError):
             continue
     return ids
+
+
+def _serial_inversor_de_chave(chave_inv, usina_id: str) -> str | None:
+    prefixo = f"{usina_id}:"
+    if not isinstance(chave_inv, str) or not chave_inv.startswith(prefixo):
+        return None
+    serial = chave_inv[len(prefixo):].strip()
+    return serial or None
+
+
+def _inversores_sem_dados_para_log(usina_id: str, falhas_ativas_atual: dict, estado_inversores: dict) -> list[str | None]:
+    seriais = []
+    for fonte in (falhas_ativas_atual, estado_inversores):
+        if not isinstance(fonte, dict):
+            continue
+        for chave_inv in fonte:
+            serial = _serial_inversor_de_chave(chave_inv, usina_id)
+            if serial and serial not in seriais:
+                seriais.append(serial)
+        if seriais:
+            break
+    return seriais or [None]
+
+
+def _mensagem_sem_dados_inversor(usina_nome, inversor_serial: str | None, motivo: str) -> str:
+    usina_txt = str(usina_nome) if usina_nome else "N/A"
+    if inversor_serial:
+        inversor_txt = f'"{inversor_serial}"'
+    else:
+        inversor_txt = "não identificado"
+    return f'Sem dados de inversor em "{usina_txt}" - Inversor: {inversor_txt} (motivo: {motivo}).'
 
 
 def _normalizar_campo_chave_rele(valor) -> str:
@@ -2635,7 +2655,7 @@ class MonitorService:
         self,
         novos_por_usina: dict,
         resolvidos_por_usina: dict,
-        pend_norm: dict,
+        pend_norm: dict,  # mutado in-place: normalizados confirmados são acumulados aqui
     ) -> list:
         notification_jobs = []
         usinas = set(novos_por_usina.keys()) | set(resolvidos_por_usina.keys()) | set(pend_norm.keys())
@@ -2931,7 +2951,12 @@ class MonitorService:
 
                 if not tem_dados_inv:
                     motivo = "TIMEOUT" if teve_timeout else "SEM_DADOS"
-                    logger_inv.warning(f"Sem dados de inversor em {nome} (motivo: {motivo}).")
+                    for inversor_serial in _inversores_sem_dados_para_log(
+                        usina_id,
+                        falhas_ativas_atual,
+                        self.estado_inversores,
+                    ):
+                        logger_inv.warning(_mensagem_sem_dados_inversor(nome, inversor_serial, motivo))
 
                 for chave_inv, estado in list(self.estado_inversores.items()):
                     if not chave_inv.startswith(f"{usina_id}:"):
