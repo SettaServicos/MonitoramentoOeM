@@ -26,3 +26,4 @@ jobs:
             source venv/bin/activate
             pip install -r requirements.txt
             echo "✅ MonitoramentoOeM deployed successfully!"
+            sudo systemctl restart monitoramento_oem
