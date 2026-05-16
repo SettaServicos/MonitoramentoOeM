@@ -61,7 +61,9 @@ except ImportError:
 RELAY_INTERVAL = 600          # 10 min
 INVERTER_INTERVAL = 900       # 15 min
 PLANTS_CACHE_TTL = timedelta(seconds=RELAY_INTERVAL)  # relay e inversor partilham a mesma lista
-RELAY_NOTIFICATION_RETRY_COOLDOWN = timedelta(seconds=RELAY_INTERVAL)
+# Cooldown menor que RELAY_INTERVAL para garantir que a varredura seguinte
+# consiga reprocessar o alerta (caso contrario, varia entre 0 e 2x o intervalo).
+RELAY_NOTIFICATION_RETRY_COOLDOWN = timedelta(seconds=RELAY_INTERVAL // 2)
 SAVE_STATE_FAIL_THRESHOLD = 3
 STOP_JOIN_TIMEOUT = 35        # aguarda encerramento das threads antes de forcar saida
 HEARTBEAT_TIMES = [
@@ -120,6 +122,9 @@ RELAY_PARAMETROS = {
     "rDO","rEPwd","rERLS","rEl2t","rFR","rGS","rHLT","rRL1","rRL2","rRL3",
     "rRL4","rRL5","rRR","r49","r49_2"
 }
+# Lookup case-insensitive: protege contra variacao de capitalizacao das chaves
+# vindas da API (mesma classe de bug que o inversor ja blindou com varios aliases de "Pac").
+RELAY_PARAMETROS_LOOKUP = {p.lower(): p for p in RELAY_PARAMETROS}
 
 # Limites para evitar crescimento indefinido do state.
 MAX_PENDING_RELE_POR_USINA = 200
@@ -836,20 +841,55 @@ def _calcular_sobreposicao_janela_solar(
     return total
 
 
+_RELE_STRINGS_ATIVAS_EXTRA = {
+    "true", "1", "on", "yes", "sim", "ativo", "active",
+    "alarm", "alarme", "trip", "tripped", "y", "t",
+}
+
+
 def _rele_param_ativo(valor) -> bool:
+    # Mantem semantica binaria estrita do contrato historico (valor == 1
+    # significa "alarme ativo"); apenas amplia o repertorio de strings
+    # aceitas para resistir a variacoes de payload (ex.: "on", "trip").
+    if valor is None:
+        return False
     if isinstance(valor, bool):
         return valor
     if isinstance(valor, (int, float)):
         return valor == 1
     if isinstance(valor, str):
         txt = valor.strip().lower()
-        if txt in {"true", "1"}:
+        if not txt:
+            return False
+        if txt in _RELE_STRINGS_ATIVAS_EXTRA:
             return True
         try:
-            return float(txt) == 1.0
+            return float(txt.replace(",", ".")) == 1.0
         except Exception:
             return False
     return False
+
+
+def _extrair_parametros_ativos_rele(conteudo_raw) -> list:
+    """Extrai parametros de rele ativos do payload da API com match case-insensitive.
+
+    Retorna nomes canonicos (definidos em RELAY_PARAMETROS), independentemente
+    da capitalizacao usada pela API. Preserva a ordem de aparicao no dict.
+    """
+    if not isinstance(conteudo_raw, dict):
+        return []
+    ativos = []
+    vistos = set()
+    for raw_key, raw_val in conteudo_raw.items():
+        if not isinstance(raw_key, str):
+            continue
+        canon = RELAY_PARAMETROS_LOOKUP.get(raw_key.strip().lower())
+        if canon is None or canon in vistos:
+            continue
+        if _rele_param_ativo(raw_val):
+            ativos.append(canon)
+            vistos.add(canon)
+    return ativos
 
 
 def _iterar_registros_api_dia(data_resp, endpoint: str, plant_id: str, logger_ctx) -> Generator[tuple[dict, dict, datetime], None, None]:
@@ -891,7 +931,17 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
             continue
 
         for registro, conteudo_raw, ts in _iterar_registros_api_dia(data_resp, "day_relay", plant_id, logger_rele):
-            idrele = registro.get("idrele")
+            # Resiliencia a variacoes de capitalizacao/nome (mesmo padrao usado
+            # para o inversor com "idinversor"/"Inversor"/"esn").
+            idrele = (
+                registro.get("idrele")
+                or registro.get("idRele")
+                or registro.get("IdRele")
+                or registro.get("id_rele")
+                or conteudo_raw.get("idrele")
+                or conteudo_raw.get("Rele")
+                or conteudo_raw.get("rele")
+            )
             if not idrele:
                 continue
             if not (inicio <= ts <= fim):
@@ -900,8 +950,23 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
             if max_ts_processado is None or ts > max_ts_processado:
                 max_ts_processado = ts
 
-            ativos = [p for p in conteudo_raw if p in RELAY_PARAMETROS and _rele_param_ativo(conteudo_raw[p])]
+            ativos = _extrair_parametros_ativos_rele(conteudo_raw)
             if not ativos:
+                # Diagnostico: payload chegou mas nenhum parametro foi reconhecido
+                # como ativo. Util para detectar mudanca de contrato da API.
+                if conteudo_raw:
+                    chaves_inesperadas = [
+                        k for k in conteudo_raw
+                        if isinstance(k, str)
+                        and k.strip().lower() not in RELAY_PARAMETROS_LOOKUP
+                        and k.lower().startswith("r")
+                    ]
+                    if chaves_inesperadas:
+                        logger_rele.debug(
+                            f"[RELE] Registro sem parametros ativos | usina={plant_id} | "
+                            f"rele={idrele} | ts={ts.isoformat()} | "
+                            f"chaves_r_desconhecidas={chaves_inesperadas[:10]}"
+                        )
                 continue
 
             tipo = "OUTROS"
@@ -2025,7 +2090,7 @@ class MonitorService:
     def _identidade_rele_conteudo_relatorio(self, conteudo):
         if not isinstance(conteudo, dict):
             return None
-        ativos = [p for p in conteudo if p in RELAY_PARAMETROS and _rele_param_ativo(conteudo[p])]
+        ativos = _extrair_parametros_ativos_rele(conteudo)
         if not ativos:
             return None
         tipo = "OUTROS"
@@ -2059,7 +2124,15 @@ class MonitorService:
                 conteudo = registro.get("conteudojson")
                 if not isinstance(conteudo, dict):
                     continue
-                rele_id = registro.get("idrele")
+                rele_id = (
+                    registro.get("idrele")
+                    or registro.get("idRele")
+                    or registro.get("IdRele")
+                    or registro.get("id_rele")
+                    or conteudo.get("idrele")
+                    or conteudo.get("Rele")
+                    or conteudo.get("rele")
+                )
                 if not rele_id:
                     continue
                 try:
@@ -3126,7 +3199,8 @@ class MonitorService:
             inv_usina_counts=inv_usina_counts,
             previsto=previsto,
         )
-        logger.info(f"[HEARTBEAT] {texto.replace('  \n', ' | ')}")
+        heartbeat_line = texto.replace("  \n", " | ")
+        logger.info(f"[HEARTBEAT] {heartbeat_line}")
         try:
             _teams_post_card(
                 title="Heartbeat: monitor rodando",
@@ -3155,7 +3229,8 @@ class MonitorService:
             )
             if card:
                 try:
-                    ok_novos = _teams_post_card(**card, max_tentativas=1)
+                    # Mesma politica de retry do inversor (default 3 tentativas).
+                    ok_novos = _teams_post_card(**card)
                 except Exception:
                     logger_rele.exception("Falha ao notificar Teams (rele falha)")
                     ok_novos = False
@@ -3169,7 +3244,7 @@ class MonitorService:
             )
             if card:
                 try:
-                    ok_norm = _teams_post_card(**card, max_tentativas=1)
+                    ok_norm = _teams_post_card(**card)
                 except Exception:
                     logger_rele.exception("Falha ao notificar Teams (rele normalizacao)")
                     ok_norm = False
