@@ -44,9 +44,14 @@ PVOP_EMAIL = os.environ.get("MONITOR_EMAIL", "").strip()
 PVOP_PASSWORD = os.environ.get("MONITOR_PASSWORD", "").strip()
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "").strip()
 TEAMS_ENABLED = bool(TEAMS_WEBHOOK_URL)
+# Diagnostico extra do circuito de rele. Ative com RELE_DEBUG=1 no .env
+# para gerar logs detalhados (payload Teams, contagens de estado, motivo
+# exato de cada decisao de envio). Desligue (RELE_DEBUG=0) apos diagnostico
+# para evitar poluir os logs em producao.
+RELE_DEBUG = os.environ.get("RELE_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
 # =========================
 
-# Lock de instância: fcntl (Unix) ou msvcrt (Windows)
+# Lock de instancia: fcntl (Unix) ou msvcrt (Windows)
 try:
     import fcntl
 except ImportError:
@@ -299,11 +304,17 @@ def _teams_post_card(
         payload["sections"] = [{"facts": [{"name": k, "value": v} for k, v in facts]}]
     max_tentativas = max(1, int(max_tentativas or 1))
     backoff_base = 2
+    payload_bytes = json.dumps(payload)
+    if RELE_DEBUG:
+        logger.info(
+            f"[TEAMS][DEBUG] POST | title={title!r} | severity={severity} | "
+            f"payload_size={len(payload_bytes)}B | payload={payload_bytes[:500]}"
+        )
     for tentativa in range(1, max_tentativas + 1):
         try:
             r = _teams_session.post(
                 TEAMS_WEBHOOK_URL,
-                data=json.dumps(payload),
+                data=payload_bytes,
                 headers={"Content-Type": "application/json"},
                 timeout=10,
             )
@@ -312,19 +323,37 @@ def _teams_post_card(
                 if espera is not None:
                     espera = min(max(0, espera), 60)
                     if tentativa == max_tentativas:
-                        logger.warning("[TEAMS] Rate limit (429) excedeu tentativas.")
+                        logger.warning(
+                            f"[TEAMS] Rate limit (429) excedeu tentativas | title={title!r}"
+                        )
                         return False
                     time.sleep(espera)
                     continue
             r.raise_for_status()
             resposta_txt = (getattr(r, "text", "") or "").strip()
             if "Webhook message delivery failed" in resposta_txt:
-                logger.warning(f"[TEAMS] Webhook aceito com falha de entrega: {resposta_txt[:300]}")
+                logger.warning(
+                    f"[TEAMS] Webhook aceito com falha de entrega | title={title!r} | "
+                    f"status={r.status_code} | body={resposta_txt[:500]!r}"
+                )
                 return False
+            if RELE_DEBUG:
+                logger.info(
+                    f"[TEAMS][DEBUG] OK | title={title!r} | status={r.status_code} | "
+                    f"body[:200]={resposta_txt[:200]!r}"
+                )
             return True
         except Exception as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            body_txt = getattr(getattr(e, "response", None), "text", "") or ""
+            # Toda tentativa que falha vira WARNING (nao so a ultima); essencial
+            # para diagnosticar webhooks que falham sistematicamente.
+            logger.warning(
+                f"[TEAMS] tentativa {tentativa}/{max_tentativas} falhou | "
+                f"title={title!r} | erro={type(e).__name__}: {e} | "
+                f"status={status_code} | body[:300]={body_txt[:300]!r}"
+            )
             if tentativa == max_tentativas:
-                logger.warning(f"[TEAMS] Falha ao enviar webhook: {e}")
                 return False
             time.sleep(backoff_base * tentativa)
     return False
@@ -714,17 +743,27 @@ def _formatar_janela_solar_label(janela_inicio: dtime, janela_fim: dtime) -> str
     return f"{janela_inicio.strftime('%H:%M')}-{janela_fim.strftime('%H:%M')}"
 
 
-def _formatar_blocos_rele(itens: list) -> str:
+def _formatar_blocos_rele(itens: list, *, markdown: bool = False) -> str:
+    # markdown=True usa o mesmo estilo do card do inversor (**Campo:** valor)
+    # que ja funciona em producao. markdown=False (default) mantem formato
+    # plano para logs internos.
     blocos = []
     for it in itens:
-        blocos.append(
-            "  \n".join([
+        if markdown:
+            linhas = [
+                f"**Relé:** {it.get('rele', 'N/A')}",
+                f"**Tipo:** {it.get('tipo', 'N/A')}",
+                f"**Horário:** {it.get('horario', '?')}",
+                f"**Parâmetros:** {it.get('parametros', '')}",
+            ]
+        else:
+            linhas = [
                 f"Relé: {it.get('rele', 'N/A')}",
                 f"Tipo: {it.get('tipo', 'N/A')}",
                 f"Horário: {it.get('horario', '?')}",
                 f"Parâmetros: {it.get('parametros', '')}",
-            ])
-        )
+            ]
+        blocos.append("  \n".join(linhas))
     return "  \n  \n".join(blocos)
 
 
@@ -732,13 +771,17 @@ def _montar_card_rele_falha(pacote: dict) -> CardTeams | None:
     novos = pacote.get("novos") or []
     if not novos:
         return None
-    texto = _formatar_blocos_rele(novos)
+    # Mesmo estilo de formatacao do card de inversor — que funciona em producao.
+    texto = _formatar_blocos_rele(novos, markdown=True)
     usina = pacote.get("usina", "N/A")
     severos = {"SOBRETENSÃO", "TÉRMICO", "BLOQUEIO"}
     severity = "danger" if any(i.get("tipo") in severos for i in novos) else "warning"
     return {
         "title": f"⚠️ Falha de relé - {usina}",
-        "text": f"  \n{texto}",
+        # Sem prefixo "  \n" — alguns renderers/regras DLP rejeitam texto
+        # iniciado por whitespace. Card de inversor (que funciona) tambem
+        # comeca direto no conteudo.
+        "text": texto,
         "severity": severity,
         "facts": [("Capacidade", f"{pacote.get('capacidade', 'N/A')} kWp")],
     }
@@ -748,11 +791,11 @@ def _montar_card_rele_normalizacao(pacote: dict) -> CardTeams | None:
     normalizados = pacote.get("normalizados") or []
     if not normalizados:
         return None
-    texto = _formatar_blocos_rele(normalizados)
+    texto = _formatar_blocos_rele(normalizados, markdown=True)
     usina = pacote.get("usina", "N/A")
     return {
         "title": f"✔️ Normalização de relé - {usina}",
-        "text": f"  \n{texto}",
+        "text": texto,
         "severity": "info",
         "facts": [("Capacidade", f"{pacote.get('capacidade', 'N/A')} kWp")],
     }
@@ -929,6 +972,13 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
         if data_resp is None:
             d += timedelta(days=1)
             continue
+
+        # Alinhado com a versao funcional (commit 7ac5717): qualquer resposta
+        # nao-vazia da API confirma comunicacao com a usina. So marcar como
+        # "sem dados" se o intervalo nao tem leituras seria muito restritivo
+        # (ex.: usinas com leituras esparsas viravam silenciosas).
+        if isinstance(data_resp, list) and data_resp:
+            tem_dados = True
 
         for registro, conteudo_raw, ts in _iterar_registros_api_dia(data_resp, "day_relay", plant_id, logger_rele):
             # Resiliencia a variacoes de capitalizacao/nome (mesmo padrao usado
@@ -2812,6 +2862,15 @@ class MonitorService:
             else:
                 inicio_padrao = datetime.combine(agora.date(), datetime.min.time())
             logger_rele.info("Varredura de rele iniciada.")
+            if RELE_DEBUG:
+                logger_rele.info(
+                    f"[RELE][DEBUG] entrada | "
+                    f"rele_alertas_ativos={len(self.rele_alertas_ativos)} | "
+                    f"rele_notificados={len(self.rele_notificados)} | "
+                    f"retry_after={len(self.rele_notificacao_retry_after)} | "
+                    f"inicio_padrao={inicio_padrao.isoformat()} | "
+                    f"ultima_varredura_rele={self.ultima_varredura_rele.isoformat() if self.ultima_varredura_rele else 'None'}"
+                )
             pend_norm = self.pending_notifications.setdefault("rele_normalizados", {})
 
             plantas, sem_plantas = self._obter_plantas(self.api_rele, logger_rele, "rele")
@@ -3228,12 +3287,25 @@ class MonitorService:
                 + _formatar_blocos_rele(novos).replace("  \n", " | ")
             )
             if card:
+                logger_rele.info(
+                    f"[RELE][SEND] tentando envio falha | usina={usina} | "
+                    f"title={card.get('title')!r} | severity={card.get('severity')} | "
+                    f"text_len={len(card.get('text') or '')} | "
+                    f"bases={[i.get('base') for i in novos]}"
+                )
                 try:
                     # Mesma politica de retry do inversor (default 3 tentativas).
                     ok_novos = _teams_post_card(**card)
                 except Exception:
                     logger_rele.exception("Falha ao notificar Teams (rele falha)")
                     ok_novos = False
+                logger_rele.info(
+                    f"[RELE][SEND] resultado falha | usina={usina} | ok={ok_novos}"
+                )
+            else:
+                logger_rele.warning(
+                    f"[RELE] Card de falha veio None apesar de novos={len(novos)} | usina={usina}"
+                )
 
         ok_norm = True
         if normalizados:
@@ -3243,11 +3315,20 @@ class MonitorService:
                 + _formatar_blocos_rele(normalizados).replace("  \n", " | ")
             )
             if card:
+                logger_rele.info(
+                    f"[RELE][SEND] tentando envio normalizacao | usina={usina} | "
+                    f"title={card.get('title')!r} | severity={card.get('severity')} | "
+                    f"text_len={len(card.get('text') or '')} | "
+                    f"bases={[i.get('base') for i in normalizados]}"
+                )
                 try:
                     ok_norm = _teams_post_card(**card)
                 except Exception:
                     logger_rele.exception("Falha ao notificar Teams (rele normalizacao)")
                     ok_norm = False
+                logger_rele.info(
+                    f"[RELE][SEND] resultado normalizacao | usina={usina} | ok={ok_norm}"
+                )
 
         return ok_novos, ok_norm
 

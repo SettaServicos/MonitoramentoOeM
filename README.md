@@ -117,6 +117,7 @@ Variáveis opcionais:
 |---|---|
 | `SSL_CERT_FILE` | Bundle CA customizado usado pelo `requests`. |
 | `REQUESTS_CA_BUNDLE` | Alternativa ao `SSL_CERT_FILE`. |
+| `RELE_DEBUG` | Quando `1` (ou `true`/`yes`/`on`), liga logs verbosos do circuito de relé: contagem de estado por varredura, payload bruto enviado ao Teams e resposta recebida. Use apenas para diagnóstico — desligue depois para não inchar `logs/rele/rele.log`. |
 
 Exemplo:
 
@@ -398,14 +399,14 @@ Campos aceitos para identificar relé:
 
 ### O que conta como dado de relé
 
-`tem_dados` só vira `True` se existir um registro com:
+`tem_dados` vira `True` em duas situações:
 
-- `conteudojson` válido;
-- `tsleitura` parseável;
-- timestamp dentro da janela;
-- `idrele`/equivalente identificado.
+1. a API retorna uma lista não-vazia para o dia, mesmo que nenhuma leitura esteja dentro da janela `[inicio, fim]`. Isso confirma comunicação com a usina e evita classificar como "sem dados" usinas com leituras esparsas;
+2. existe pelo menos um registro com `conteudojson` válido, `tsleitura` parseável, timestamp dentro da janela e `idrele`/equivalente identificado.
 
-Um payload sem parâmetro ativo ainda conta como dado, desde que tenha passado nesses filtros. Isso é importante: "sem parâmetro ativo" pode significar relé normal, não ausência de dados.
+A primeira regra foi reintroduzida porque a versão anterior só marcava `tem_dados=True` se houvesse leitura dentro da janela exata — o que jogava várias usinas para `usinas_sem_dados` em janelas vazias e pulava o processamento. O comportamento atual está alinhado com a versão funcional histórica (commit `7ac5717`).
+
+Um payload sem parâmetro ativo ainda conta como dado: "sem parâmetro ativo" significa relé normal, não ausência de comunicação.
 
 ### O que conta como parâmetro ativo
 
@@ -736,14 +737,25 @@ Severidades:
 
 ### Política de retry
 
-O envio tenta até 3 vezes por padrão.
+O envio tenta até 3 vezes por padrão. Esse mesmo valor é usado tanto para relé quanto para inversor — não há mais a configuração antiga `max_tentativas=1` que era exclusiva do relé.
 
 Tratamentos:
 
 - HTTP `429`: respeita `Retry-After`, limitado a 60s;
 - exceções: retry com backoff simples;
-- resposta com corpo contendo `Webhook message delivery failed`: tratada como falha mesmo se HTTP for `200`;
+- resposta com corpo contendo `Webhook message delivery failed`: tratada como falha mesmo se HTTP for `200`. O corpo completo da resposta (até 500 chars) é logado em `WARNING` para diagnóstico;
+- toda tentativa que falha (não só a última) é logada como `WARNING` com `status` HTTP, tipo de exceção e prefixo do corpo. Isso é essencial para diagnosticar webhooks que falham sistematicamente;
 - falha final: retorna `False`.
+
+### Cooldown de retry de relé
+
+Quando o envio de um alerta de relé falha, o sistema agenda um retry para evitar marteladas:
+
+```python
+RELAY_NOTIFICATION_RETRY_COOLDOWN = timedelta(seconds=RELAY_INTERVAL // 2)  # 5 minutos
+```
+
+O cooldown é deliberadamente menor que `RELAY_INTERVAL` (10 min). Se fosse igual, a varredura seguinte cairia exatamente no instante em que `_retry_rele_adiado()` ainda retorna `True`, e o alerta ficaria pulando uma execução inteira. Com cooldown de 5 min, a próxima varredura sempre reprocessa.
 
 ### Relés
 
@@ -751,8 +763,10 @@ Relés são notificados agrupados por usina.
 
 Tipos de card:
 
-- falha de relé: `danger`;
+- falha de relé: `danger` para `SOBRETENSÃO`/`TÉRMICO`/`BLOQUEIO`, `warning` para os demais tipos;
 - normalização de relé: `info`.
+
+O `text` dos cards de relé usa o mesmo padrão markdown do card de inversor (`**Campo:** valor`), alinhando o renderer no Teams e evitando que o card seja rejeitado por regras de conteúdo que recusam texto iniciado por whitespace.
 
 Falha no envio de alerta novo:
 
@@ -1107,10 +1121,13 @@ Marcadores úteis:
 |---|---|
 | `[HEARTBEAT]` | Heartbeat gerado/logado. |
 | `[SCAN]` | Duração de fase de scan. |
-| `[RELE]` | Eventos internos do fluxo de relé. |
+| `[RELE]` | Eventos internos do fluxo de relé (detecção, supressão, retry adiado). |
+| `[RELE][SEND]` | Tentativa de envio de card de relé para Teams. Loga `title`, `severity`, `bases` e o resultado (`ok=True/False`). |
+| `[RELE][DEBUG]` | Diagnóstico verboso do relé. Aparece apenas com `RELE_DEBUG=1`. |
 | `[ALERTA INVERSOR]` | Falha de inversor notificada/logada. |
 | `[RECUPERACAO INVERSOR]` | Recuperação de inversor notificada/logada. |
-| `[TEAMS]` | Falha, retry ou detalhe de webhook. |
+| `[TEAMS]` | Tentativa, falha ou detalhe de webhook. Toda tentativa que falha vira `WARNING` (não só a última), com `status` HTTP e prefixo do corpo da resposta. |
+| `[TEAMS][DEBUG]` | Payload bruto enviado e corpo de resposta recebido. Aparece apenas com `RELE_DEBUG=1`. |
 | `[RELATORIO]` | Coleta e geração do relatório semanal. |
 
 ---
