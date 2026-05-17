@@ -757,6 +757,14 @@ RELAY_NOTIFICATION_RETRY_COOLDOWN = timedelta(seconds=RELAY_INTERVAL // 2)  # 5 
 
 O cooldown é deliberadamente menor que `RELAY_INTERVAL` (10 min). Se fosse igual, a varredura seguinte cairia exatamente no instante em que `_retry_rele_adiado()` ainda retorna `True`, e o alerta ficaria pulando uma execução inteira. Com cooldown de 5 min, a próxima varredura sempre reprocessa.
 
+Além dos alertas redetectados pela API, cada varredura chama `_reenfileirar_retries_rele_ativos()`. Essa função reconstrói o lote de envio a partir de `rele_alertas_ativos` e `rele_alerta_chave` quando:
+
+- a base ainda está ativa;
+- a base ainda não está em `rele_notificados`;
+- não existe `retry_after` futuro bloqueando o envio.
+
+Isso evita perder a notificação quando o primeiro envio falha e, nos scans seguintes, a usina passa a retornar `SEM_DADOS`, timeout parcial ou lista parcial. Nesses casos, o alerta ativo continua preservado no state e o retry é remontado a partir dos detalhes persistidos, sem depender de a API repetir a leitura ativa do relé.
+
 ### Relés
 
 Relés são notificados agrupados por usina.
@@ -773,7 +781,7 @@ Falha no envio de alerta novo:
 - a base fica ativa;
 - não entra em `rele_notificados`;
 - recebe `retry_after` em `rele_notificacao_retry_after`;
-- será reenviada em scan futuro.
+- será reenviada em scan futuro quando a API redetectar o alerta ou quando `_reenfileirar_retries_rele_ativos()` reconstruir o job a partir do state ativo.
 
 Falha no envio de normalização:
 
@@ -901,7 +909,7 @@ Isso reduz risco de arquivo parcialmente escrito.
 | `rele_alertas_ativos` | Bases de alertas de relé atualmente ativos. |
 | `rele_notificados` | Bases de relé já notificadas com sucesso. |
 | `rele_notificacao_retry_after` | Próximo momento permitido para retry de alerta de relé. |
-| `rele_alerta_chave` | Detalhes formatados de cada alerta de relé ativo. |
+| `rele_alerta_chave` | Detalhes formatados de cada alerta de relé ativo. Também é usado para reconstruir retries de alertas ativos ainda não notificados. |
 | `estado_inversores` | Estado por chave `usina_id:inversor_id`. |
 | `pending_notifications` | Normalizações pendentes de envio. |
 | `incidentes_rele_ativos` | Incidentes de relé em aberto. |
@@ -1173,6 +1181,7 @@ Arquivos:
 - preservação de alertas ativos em timeout;
 - notificações Teams fora do `_scan_lock`;
 - retry de Teams;
+- retry de alerta de relé ativo mesmo sem nova leitura válida da API;
 - falha de webhook com HTTP 200 mas corpo de erro;
 - pending notifications;
 - state legado;
@@ -1273,4 +1282,4 @@ python -m pytest -q
 | Lock | `state/.monitor_lock`. |
 | Logs de relé | `logs/rele/rele.log`. |
 | Logs de inversor | `logs/inversor/inversor.log`. |
-| Testes | 134 casos coletados pelo pytest. |
+| Testes | 135 casos coletados pelo pytest. |

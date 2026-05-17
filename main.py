@@ -2774,6 +2774,51 @@ class MonitorService:
                 )
         return resolvidos_por_usina
 
+    def _reenfileirar_retries_rele_ativos(self, novos_por_usina: dict, agora: datetime) -> None:
+        bases_enfileiradas = {
+            item.get("base")
+            for grupo in novos_por_usina.values()
+            for item in grupo.get("itens", [])
+            if isinstance(item, dict) and item.get("base")
+        }
+        for base in sorted(self.rele_alertas_ativos):
+            if base in self.rele_notificados or base in bases_enfileiradas:
+                continue
+            if self._retry_rele_adiado(base, agora):
+                retry_after = self.rele_notificacao_retry_after.get(base)
+                logger_rele.info(
+                    f"[RELE] Retry de alerta ativo adiado | base={base} | retry_after={retry_after}"
+                )
+                continue
+            alerta = self.rele_alerta_chave.get(base)
+            if not isinstance(alerta, dict):
+                logger_rele.warning(
+                    f"[RELE] Retry de alerta ativo sem detalhes persistidos; envio adiado | base={base}"
+                )
+                continue
+            usina_id, rele_id, tipo, parametros = _partes_chave_rele(base)
+            alerta_fmt = dict(alerta)
+            alerta_fmt["base"] = base
+            grupo = novos_por_usina.setdefault(
+                usina_id,
+                {
+                    "usina": alerta_fmt.get("usina"),
+                    "capacidade": alerta_fmt.get("capacidade"),
+                    "itens": [],
+                },
+            )
+            if not grupo.get("usina") and alerta_fmt.get("usina"):
+                grupo["usina"] = alerta_fmt.get("usina")
+            if grupo.get("capacidade") is None and alerta_fmt.get("capacidade") is not None:
+                grupo["capacidade"] = alerta_fmt.get("capacidade")
+            grupo["itens"].append(alerta_fmt)
+            bases_enfileiradas.add(base)
+            logger_rele.info(
+                f"[RELE] Retry de alerta ativo reenfileirado | base={base} | "
+                f"usina={alerta_fmt.get('usina')} | rele={alerta_fmt.get('rele', rele_id)} | "
+                f"tipo={alerta_fmt.get('tipo', tipo)} | parametros={parametros}"
+            )
+
     def _montar_jobs_notificacao_rele(
         self,
         novos_por_usina: dict,
@@ -2931,6 +2976,7 @@ class MonitorService:
                     if base.split(":", 1)[0] in usinas_sem_dados:
                         bases_ativos_atual.add(base)
             resolvidos_por_usina = self._registrar_resolucoes_rele(bases_ativos_atual, agora)
+            self._reenfileirar_retries_rele_ativos(novos_por_usina, agora)
             # recalcula usinas com rele ativo a partir do conjunto de alertas ativos
             self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
 
