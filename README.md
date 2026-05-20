@@ -567,7 +567,15 @@ Pulando inversores de <usina> devido a alerta de rele recente.
 
 Motivo operacional: uma falha de relé pode ser causa raiz para inversores parados. O monitor evita gerar ruído redundante de inversor quando já existe alerta ativo de relé na mesma usina.
 
-Ao pular por relé, o estado de inversor não é avançado nem limpo.
+Quando uma usina entra em hierarquia de relé ativo, o monitor também descarta artefatos de inversor da mesma usina que tenham sido criados antes de o relé ser reconhecido:
+
+- remove normalizações pendentes em `pending_notifications["inv_normalizados"]`;
+- remove incidentes abertos em `incidentes_inv_ativos`;
+- limpa `alerta`, `notificado`, `seq_zero`, `rec_seq`, `ausente_scans` e `ultima_confirmacao_ts` dos inversores afetados;
+- não move esses incidentes de inversor para `historico_incidentes`;
+- não envia Teams de falha nem de normalização de inversor para esses artefatos.
+
+Essa regra reproduz o comportamento operacional esperado da versão que funcionava: se a causa raiz é relé, a usina deve comunicar falha/normalização de relé, não uma cascata de inversores. Após a normalização do relé, um inversor só volta a notificar se formar uma nova sequência válida de falha depois desse período.
 
 ### Janelas solares
 
@@ -800,6 +808,8 @@ Tipos:
 - `rec_retry`.
 
 Falha ativa não notificada pode gerar `falha_resend` no próximo scan. Normalização pendente fica em `pending_notifications["inv_normalizados"]`.
+
+Exceção importante: se a usina estiver sob alerta de relé ativo, pendências e estados de inversor da mesma usina são descartados silenciosamente. Isso impede que, depois da normalização do relé, o Teams receba normalizações de inversor que eram apenas consequência do evento de relé.
 
 ### Importante sobre ordem de persistência
 
@@ -1282,4 +1292,4 @@ python -m pytest -q
 | Lock | `state/.monitor_lock`. |
 | Logs de relé | `logs/rele/rele.log`. |
 | Logs de inversor | `logs/inversor/inversor.log`. |
-| Testes | 135 casos coletados pelo pytest. |
+| Testes | 138 casos coletados pelo pytest. |

@@ -1792,6 +1792,49 @@ class MonitorService:
             estado["ausente_scans"] = ausente_scans
             self.estado_inversores[chave_inv] = estado
 
+    def _suprimir_inversores_por_rele_ativo(self, usinas_ids) -> None:
+        usinas = {str(uid) for uid in (usinas_ids or []) if uid}
+        if not usinas:
+            return
+
+        pend_inv = self.pending_notifications.setdefault("inv_normalizados", {})
+        chaves_alvo = set()
+
+        for chave in list(pend_inv.keys()):
+            uid = chave.split(":", 1)[0] if ":" in chave else None
+            if uid in usinas:
+                chaves_alvo.add(chave)
+                pend_inv.pop(chave, None)
+
+        for chave in list(self.incidentes_inv_ativos.keys()):
+            uid = chave.split(":", 1)[0] if ":" in chave else None
+            if uid in usinas:
+                chaves_alvo.add(chave)
+                self.incidentes_inv_ativos.pop(chave, None)
+
+        for chave, estado in list(self.estado_inversores.items()):
+            uid = chave.split(":", 1)[0] if ":" in chave else None
+            if uid not in usinas or not isinstance(estado, dict):
+                continue
+            if estado.get("ativa") or estado.get("notificado") or estado.get("alerta") is not None:
+                chaves_alvo.add(chave)
+
+        for chave in chaves_alvo:
+            estado = self.estado_inversores.get(chave)
+            if not isinstance(estado, dict):
+                continue
+            estado.update({
+                "ativa": False,
+                "rec_seq": 0,
+                "seq_zero": 0,
+                "alerta": None,
+                "notificado": False,
+                "ausente_scans": 0,
+                "ultima_confirmacao_ts": None,
+            })
+            self.estado_inversores[chave] = estado
+            logger_inv.info(f"Suprimindo inversor {chave} por hierarquia de rele ativo.")
+
     # Carrega estado de ultima varredura e listas de alertas persistidos em disco.
     def _load_state(self):
         if not STATE_FILE.exists():
@@ -2975,10 +3018,14 @@ class MonitorService:
                 for base in self.rele_alertas_ativos:
                     if base.split(":", 1)[0] in usinas_sem_dados:
                         bases_ativos_atual.add(base)
+            self._suprimir_inversores_por_rele_ativo(
+                {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
+            )
             resolvidos_por_usina = self._registrar_resolucoes_rele(bases_ativos_atual, agora)
             self._reenfileirar_retries_rele_ativos(novos_por_usina, agora)
             # recalcula usinas com rele ativo a partir do conjunto de alertas ativos
             self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
+            self._suprimir_inversores_por_rele_ativo(self.usinas_alerta_rele_recente)
 
             # envia uma notificação por usina consolidando alertas novos, normalizados e pendentes
             notification_jobs = self._montar_jobs_notificacao_rele(
@@ -3014,6 +3061,7 @@ class MonitorService:
                 inicio_padrao = datetime.combine(agora.date(), datetime.min.time())
             logger_inv.info("Varredura de inversor iniciada.")
             pend_norm = self.pending_notifications.setdefault("inv_normalizados", {})
+            self._suprimir_inversores_por_rele_ativo(self.usinas_alerta_rele_recente)
 
             notification_inv_jobs = []
 
