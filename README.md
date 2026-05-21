@@ -369,9 +369,9 @@ Depois disso, usa checkpoint por usina:
 ultima_varredura_rele_por_usina[usina_id] + 1 segundo
 ```
 
-O checkpoint por usina avança com `max_ts_rele`, que é o maior `tsleitura` válido processado, não simplesmente `datetime.now()`.
+O checkpoint por usina avança com o horário da varredura (`agora`) quando a usina retorna dados válidos e não houve timeout parcial.
 
-Isso reduz risco de pular leituras atrasadas, desde que a API retorne dados com timestamps consistentes.
+Essa regra segue a versão operacional que funcionava: a próxima consulta começa depois da varredura concluída, não depois do timestamp do último registro retornado pela API.
 
 ### Como os dados são lidos
 
@@ -385,7 +385,8 @@ Isso reduz risco de pular leituras atrasadas, desde que a API retorne dados com 
 6. filtra registros fora de `[inicio, fim]`;
 7. extrai o identificador do relé;
 8. extrai parâmetros ativos;
-9. agrupa eventos por chave de alerta.
+9. registra leituras sem parâmetro ativo como evidência de relé normal;
+10. agrupa eventos ativos por chave de alerta.
 
 Campos aceitos para identificar relé:
 
@@ -450,16 +451,20 @@ Se um registro tiver parâmetros de mais de uma classe, a primeira classe encont
 A chave atual é:
 
 ```txt
-usina_id:rele_id:tipo_alerta:parametros_normalizados
-```
-
-O código também reconhece chaves legadas sem parâmetros:
-
-```txt
 usina_id:rele_id:tipo_alerta
 ```
 
-Quando encontra chave legada ativa, `_migrar_chave_rele_ativa()` migra o estado para a chave nova, incluindo:
+Os parâmetros continuam aparecendo no card, no histórico e no relatório, mas não fazem parte da identidade operacional do alerta ativo.
+
+Motivo: a regra operacional validada nos commits funcionais tratava o alerta como "este relé está em falha deste tipo". Se os parâmetros mudam dentro do mesmo tipo, isso atualiza os detalhes do alerta, mas não deve criar outro alerta nem normalizar o anterior.
+
+O código também reconhece chaves parametrizadas gravadas por versões anteriores:
+
+```txt
+usina_id:rele_id:tipo_alerta:parametros_normalizados
+```
+
+Quando encontra uma chave parametrizada ativa para o mesmo relé/tipo, `_migrar_chave_rele_ativa()` migra o estado para a chave operacional sem parâmetros, incluindo:
 
 - `rele_alertas_ativos`;
 - `rele_notificados`;
@@ -521,7 +526,16 @@ Depois de processar as leituras válidas, o scanner compara:
 - `rele_alertas_ativos` persistidos;
 - `bases_ativos_atual` detectados na varredura atual.
 
-Se uma base estava ativa antes e não apareceu agora, ela é resolvida por `_registrar_resolucoes_rele()`, desde que a usina não esteja em condição de sem dados/lista parcial.
+Uma base de relé só é resolvida por `_registrar_resolucoes_rele()` quando existe evidência positiva de normalização: uma leitura posterior do mesmo `usina_id + rele_id` sem parâmetro ativo.
+
+Ausência do alerta na janela atual não é suficiente para normalizar. Isso evita o falso positivo observado quando a API entrega o alarme como evento discreto: o alerta aparece em um scan, não aparece no próximo, e o código antigo concluía normalização sem uma leitura limpa real.
+
+Condições práticas:
+
+- se a usina está em `SEM_DADOS`, `TIMEOUT_PARCIAL` ou lista parcial, alertas ativos são preservados;
+- se o relé ativo não apareceu no scan atual e também não houve leitura limpa posterior para o mesmo relé, o alerta continua ativo;
+- se a mesma janela contém uma leitura ativa e uma leitura limpa posterior do mesmo relé, a leitura limpa prevalece para evitar manter ativo um evento já encerrado;
+- se houve leitura limpa posterior para o mesmo relé, o alerta é resolvido e a normalização pode ser notificada.
 
 Ao resolver:
 
@@ -714,7 +728,7 @@ Configuração:
 INVERTER_MISSING_SCAN_TOLERANCE = 3
 ```
 
-Isso faz o inversor sair do heartbeat, mas não encerra o incidente. A regra evita normalização falsa quando o equipamento simplesmente deixou de aparecer nos dados.
+Isso marca a confirmação como antiga, mas não tira o inversor ativo do heartbeat. A regra evita normalização falsa quando o equipamento simplesmente deixou de aparecer nos dados.
 
 ---
 
@@ -867,21 +881,13 @@ agora - ultima_varredura_inversor > 2 * INVERTER_INTERVAL
 
 ### Inversor no heartbeat
 
-Um inversor só entra no heartbeat se:
+Um inversor entra no heartbeat se:
 
-- `ativa=True`;
-- possui `ultima_confirmacao_ts`;
-- a confirmação é recente.
+- `ativa=True`.
 
-TTL:
+`ultima_confirmacao_ts` continua existindo no estado para diagnóstico e reconciliação, mas não remove uma falha ativa do heartbeat.
 
-```python
-INVERTER_HEARTBEAT_CONFIRMATION_TTL = (INVERTER_INTERVAL * 3) + 60s
-```
-
-Com `INVERTER_INTERVAL = 900`, isso equivale a 46 minutos.
-
-Se o inversor ativo deixa de aparecer por scans consecutivos, `ultima_confirmacao_ts` é removido e ele sai do heartbeat sem encerrar o incidente.
+Motivo operacional: se o inversor ainda está ativo no estado, o operador precisa ver que a falha persiste, inclusive fora da janela solar ou sem confirmação recente. A falha só deixa o heartbeat quando há recuperação real, supressão por hierarquia de relé ou limpeza explícita do estado ativo.
 
 ---
 
@@ -1216,13 +1222,13 @@ Relés e inversores preservam estado ativo quando a API falha, retorna timeout, 
 
 Não marque alerta como notificado antes do Teams confirmar sucesso. Se fizer isso, uma queda de rede pode causar perda definitiva de alerta.
 
-### 3. Chaves de relé incluem parâmetros
+### 3. Chaves de relé não incluem parâmetros
 
-A chave nova de relé inclui parâmetros normalizados. Isso permite separar falhas de mesmo relé e mesmo tipo, mas com parâmetros diferentes.
+A chave operacional de relé é `usina_id:rele_id:tipo_alerta`. Parâmetros são detalhe do alerta, não identidade. Reintroduzir parâmetros na chave pode recriar normalizações falsas ou duplicidade de alerta quando a API muda a combinação de bits ativos dentro do mesmo tipo.
 
-### 4. Inversor ativo pode sair do heartbeat sem normalizar
+### 4. Inversor ativo permanece no heartbeat
 
-Isso é intencional. `ausente_scans` e `ultima_confirmacao_ts` controlam visibilidade no heartbeat, mas não encerram o incidente.
+Isso é intencional. `ausente_scans` e `ultima_confirmacao_ts` indicam qualidade/recência da confirmação, mas não removem uma falha ativa da contabilização do heartbeat.
 
 ### 5. O cliente API não é preparado para paralelismo amplo
 
@@ -1285,11 +1291,11 @@ python -m pytest -q
 | Falha de inversor | 3 leituras consecutivas com `PAC <= 0`. |
 | Recuperação de inversor | 2 leituras consecutivas com `PAC > 0`. |
 | Supressão de inversor ausente | 3 scans válidos sem observação. |
-| TTL de inversor no heartbeat | 46 minutos. |
+| Critério de inversor no heartbeat | `ativa=True`. |
 | Retry Teams | 3 tentativas. |
 | Timeout `post_day` | 30 segundos por tentativa. |
 | State | `state/monitor_state.json`. |
 | Lock | `state/.monitor_lock`. |
 | Logs de relé | `logs/rele/rele.log`. |
 | Logs de inversor | `logs/inversor/inversor.log`. |
-| Testes | 138 casos coletados pelo pytest. |
+| Testes | 142 casos coletados pelo pytest. |

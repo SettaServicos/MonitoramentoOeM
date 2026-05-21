@@ -140,7 +140,6 @@ INVERTER_CONSECUTIVE_READINGS = 3
 INVERTER_RECOVERY_CONSECUTIVE_READINGS = 2
 INVERTER_FAILURE_LABEL = f"PAC=0 ({INVERTER_CONSECUTIVE_READINGS} leituras consecutivas)"
 INVERTER_MISSING_SCAN_TOLERANCE = 3
-INVERTER_HEARTBEAT_CONFIRMATION_TTL = timedelta(seconds=(INVERTER_INTERVAL * 3) + 60)
 
 # SSL: ajuste para o bundle correto no servidor (ex.: /etc/ssl/certs/ca.pem)
 VERIFY_CA = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or True
@@ -960,6 +959,7 @@ def _iterar_registros_api_dia(data_resp, endpoint: str, plant_id: str, logger_ct
 # Varre leituras de rele no intervalo informado para encontrar eventos e classifica-los.
 def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, fim: datetime):
     agrupados = {}
+    normais_por_rele = {}
     tem_dados = False
     teve_timeout = False
     max_ts_processado = None
@@ -1002,6 +1002,13 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
 
             ativos = _extrair_parametros_ativos_rele(conteudo_raw)
             if not ativos:
+                rele_key = (
+                    _normalizar_campo_chave_rele(plant_id),
+                    _normalizar_campo_chave_rele(idrele),
+                )
+                ts_normal_anterior = normais_por_rele.get(rele_key)
+                if ts_normal_anterior is None or ts > ts_normal_anterior:
+                    normais_por_rele[rele_key] = ts
                 # Diagnostico: payload chegou mas nenhum parametro foi reconhecido
                 # como ativo. Util para detectar mudanca de contrato da API.
                 if conteudo_raw:
@@ -1047,15 +1054,22 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
         d += timedelta(days=1)
 
     if not agrupados:
-        return [], tem_dados, teve_timeout, max_ts_processado
+        return [], tem_dados, teve_timeout, max_ts_processado, normais_por_rele
 
     candidatos = []
     for entry in agrupados.values():
+        rele_key = (
+            _normalizar_campo_chave_rele(plant_id),
+            _normalizar_campo_chave_rele(entry["rele_id"]),
+        )
+        ts_normal = normais_por_rele.get(rele_key)
+        if isinstance(ts_normal, datetime) and ts_normal > entry["ts_ultimo"]:
+            continue
         entry["ts_leitura"] = entry["ts_ultimo"]
         entry["parametros"] = ", ".join(sorted(entry.pop("parametros_set")))
         candidatos.append(entry)
     candidatos.sort(key=lambda a: a["ts_leitura"])
-    return candidatos, tem_dados, teve_timeout, max_ts_processado
+    return candidatos, tem_dados, teve_timeout, max_ts_processado, normais_por_rele
 
 
 def _horario_esta_na_janela(referencia: datetime, janela_ini_t: dtime, janela_fim_t: dtime) -> bool:
@@ -1280,6 +1294,10 @@ def _normalizar_parametros_rele(parametros) -> str:
 
 
 def _chave_evento_rele(usina_id, rele_id, tipo_alerta, parametros) -> str:
+    return _chave_legada_rele(usina_id, rele_id, tipo_alerta)
+
+
+def _chave_parametrizada_rele(usina_id, rele_id, tipo_alerta, parametros) -> str:
     return ":".join([
         _normalizar_campo_chave_rele(usina_id),
         _normalizar_campo_chave_rele(rele_id),
@@ -1374,7 +1392,7 @@ class MonitorService:
         self.ultima_varredura_inversor = None
         self.ultima_varredura_rele_por_usina = {}
         self.ultima_varredura_inversor_por_usina = {}
-        self.rele_alertas_ativos = set()      # usina:rele:tipo:parametros
+        self.rele_alertas_ativos = set()      # usina:rele:tipo
         self.rele_alerta_chave = {}
         self.rele_notificados = set()
         self.rele_notificacao_retry_after = {}
@@ -1786,7 +1804,7 @@ class MonitorService:
 
             if estado.get("ultima_confirmacao_ts") is not None:
                 logger_inv.warning(
-                    f"Inversor {chave_inv} ausente em {ausente_scans} varreduras validas; suprimindo do heartbeat."
+                    f"Inversor {chave_inv} ausente em {ausente_scans} varreduras validas; mantendo alerta ativo sem confirmacao recente."
                 )
                 estado["ultima_confirmacao_ts"] = None
             estado["ausente_scans"] = ausente_scans
@@ -2681,26 +2699,26 @@ class MonitorService:
         nome: str | None,
         inicio_padrao: datetime,
         agora: datetime,
-    ) -> tuple[list, bool, datetime | None]:
+    ) -> tuple[list, bool, datetime | None, dict]:
         last_usina = self.ultima_varredura_rele_por_usina.get(usina_id)
         if last_usina:
             inicio_janela = last_usina + timedelta(seconds=WINDOW_DELTA_SECONDS)
         else:
             inicio_janela = inicio_padrao
 
-        alertas, tem_dados, teve_timeout, max_ts_rele = detectar_alertas_rele(
+        alertas, tem_dados, teve_timeout, max_ts_rele, normais_por_rele = detectar_alertas_rele(
             self.api_rele, usina_id, inicio_janela, agora
         )
         if not tem_dados:
             motivo = "TIMEOUT" if teve_timeout else "SEM_DADOS"
             logger_rele.warning(f"Sem dados de relé em {nome} (motivo: {motivo}). Mantendo alertas ativos.")
-            return [], True, max_ts_rele
+            return [], True, max_ts_rele, normais_por_rele
         if teve_timeout:
             logger_rele.warning(
                 f"Dados parciais de relé em {nome} (motivo: TIMEOUT_PARCIAL). Mantendo alertas ativos."
             )
-            return [], True, max_ts_rele
-        return alertas, False, max_ts_rele
+            return [], True, max_ts_rele, normais_por_rele
+        return alertas, False, max_ts_rele, normais_por_rele
 
     def _montar_alerta_rele_formatado(
         self,
@@ -2739,9 +2757,16 @@ class MonitorService:
     ) -> None:
         parametros_base = alerta_raw.get("parametros_chave") or alerta_raw.get("parametros", "")
         base = _chave_evento_rele(usina_id, alerta_raw["rele_id"], alerta_raw["tipo_alerta"], parametros_base)
+        base_parametrizada = _chave_parametrizada_rele(
+            usina_id,
+            alerta_raw["rele_id"],
+            alerta_raw["tipo_alerta"],
+            parametros_base,
+        )
         bases_legadas = {
             f"{usina_id}:{alerta_raw['rele_id']}:{alerta_raw['tipo_alerta']}",
             _chave_legada_rele(usina_id, alerta_raw["rele_id"], alerta_raw["tipo_alerta"]),
+            base_parametrizada,
         }
         for base_legada in bases_legadas:
             self._migrar_chave_rele_ativa(base_legada, base)
@@ -2794,10 +2819,39 @@ class MonitorService:
                 f"parametros={parametros_base}"
             )
 
-    def _registrar_resolucoes_rele(self, bases_ativos_atual: set, agora: datetime) -> dict:
+    def _normalizacao_rele_confirmada(self, base: str, reles_normais_por_usina: dict | None) -> bool:
+        if not reles_normais_por_usina:
+            return False
+        usina_id, rele_id, _, _ = _partes_chave_rele(base)
+        rele_key = (
+            _normalizar_campo_chave_rele(usina_id),
+            _normalizar_campo_chave_rele(rele_id),
+        )
+        ts_normal = reles_normais_por_usina.get(rele_key)
+        if not isinstance(ts_normal, datetime):
+            ts_normal = _parse_iso_datetime(ts_normal)
+        if ts_normal is None:
+            return False
+        alerta_antigo = self.rele_alerta_chave.get(base) or {}
+        ts_alerta = _parse_iso_datetime(alerta_antigo.get("ts_iso"))
+        if ts_alerta is None:
+            return False
+        return ts_normal > ts_alerta
+
+    def _registrar_resolucoes_rele(
+        self,
+        bases_ativos_atual: set,
+        agora: datetime,
+        reles_normais_por_usina: dict | None = None,
+    ) -> dict:
         resolvidos_por_usina = {}
         resolved = self.rele_alertas_ativos - bases_ativos_atual
         for base in resolved:
+            if not self._normalizacao_rele_confirmada(base, reles_normais_por_usina):
+                logger_rele.debug(
+                    f"[RELE] Alerta ativo preservado sem leitura limpa posterior | base={base}"
+                )
+                continue
             alerta_antigo = self._resolver_alerta_rele(base, fim_ts=agora)
             if alerta_antigo:
                 usina_id, rele_id, tipo, _ = _partes_chave_rele(base)
@@ -2975,6 +3029,7 @@ class MonitorService:
             bases_ativos_atual = set()
             novos_por_usina = {}
             usinas_sem_dados = set(ausentes_rele)
+            reles_normais_por_usina = {}
 
             for p in plantas:
                 usina_id_raw = p.get("id")
@@ -2989,7 +3044,7 @@ class MonitorService:
                 nome = p.get("nome")
                 cap = p.get("capacidade")
 
-                alertas, preservar_ativos, max_ts_rele = self._coletar_alertas_rele_usina(
+                alertas, preservar_ativos, max_ts_rele, normais_por_rele = self._coletar_alertas_rele_usina(
                     usina_id=usina_id,
                     nome=nome,
                     inicio_padrao=inicio_padrao,
@@ -2998,6 +3053,7 @@ class MonitorService:
                 if preservar_ativos:
                     usinas_sem_dados.add(usina_id)
                     continue
+                reles_normais_por_usina.update(normais_por_rele)
 
                 for a in alertas:
                     self._registrar_alerta_rele_detectado(
@@ -3011,8 +3067,7 @@ class MonitorService:
                         agora=agora,
                     )
 
-                if max_ts_rele is not None:
-                    self.ultima_varredura_rele_por_usina[usina_id] = max_ts_rele
+                self.ultima_varredura_rele_por_usina[usina_id] = agora
 
             if usinas_sem_dados:
                 for base in self.rele_alertas_ativos:
@@ -3021,7 +3076,11 @@ class MonitorService:
             self._suprimir_inversores_por_rele_ativo(
                 {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
             )
-            resolvidos_por_usina = self._registrar_resolucoes_rele(bases_ativos_atual, agora)
+            resolvidos_por_usina = self._registrar_resolucoes_rele(
+                bases_ativos_atual,
+                agora,
+                reles_normais_por_usina=reles_normais_por_usina,
+            )
             self._reenfileirar_retries_rele_ativos(novos_por_usina, agora)
             # recalcula usinas com rele ativo a partir do conjunto de alertas ativos
             self.usinas_alerta_rele_recente = {k.split(":", 1)[0] for k in self.rele_alertas_ativos}
@@ -3271,12 +3330,7 @@ class MonitorService:
     def _inversor_conta_no_heartbeat(estado: dict, referencia: datetime) -> bool:
         if not isinstance(estado, dict):
             return False
-        if not estado.get("ativa"):
-            return False
-        ultima_confirmacao = _parse_iso_datetime(estado.get("ultima_confirmacao_ts"))
-        if not ultima_confirmacao or not isinstance(referencia, datetime):
-            return False
-        return (referencia - ultima_confirmacao) <= INVERTER_HEARTBEAT_CONFIRMATION_TTL
+        return bool(estado.get("ativa"))
 
     @staticmethod
     def _proximo_horario_heartbeat(ref: datetime) -> datetime:
