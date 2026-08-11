@@ -1006,9 +1006,10 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
                     _normalizar_campo_chave_rele(plant_id),
                     _normalizar_campo_chave_rele(idrele),
                 )
-                ts_normal_anterior = normais_por_rele.get(rele_key)
-                if ts_normal_anterior is None or ts > ts_normal_anterior:
-                    normais_por_rele[rele_key] = ts
+                # Guarda TODAS as leituras limpas (ordenadas ao final): a
+                # ultima serve a supressao de candidatos; a primeira posterior
+                # ao alerta e a evidencia real de normalizacao (fim_ts).
+                normais_por_rele.setdefault(rele_key, []).append(ts)
                 # Diagnostico: payload chegou mas nenhum parametro foi reconhecido
                 # como ativo. Util para detectar mudanca de contrato da API.
                 if conteudo_raw:
@@ -1053,6 +1054,9 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
                 entry["parametros_set"].update(ativos)
         d += timedelta(days=1)
 
+    for leituras_normais in normais_por_rele.values():
+        leituras_normais.sort()
+
     if not agrupados:
         return [], tem_dados, teve_timeout, max_ts_processado, normais_por_rele
 
@@ -1062,8 +1066,8 @@ def detectar_alertas_rele(api: PVOperationAPI, plant_id: str, inicio: datetime, 
             _normalizar_campo_chave_rele(plant_id),
             _normalizar_campo_chave_rele(entry["rele_id"]),
         )
-        ts_normal = normais_por_rele.get(rele_key)
-        if isinstance(ts_normal, datetime) and ts_normal > entry["ts_ultimo"]:
+        leituras_normais = normais_por_rele.get(rele_key)
+        if leituras_normais and leituras_normais[-1] > entry["ts_ultimo"]:
             continue
         entry["ts_leitura"] = entry["ts_ultimo"]
         entry["parametros"] = ", ".join(sorted(entry.pop("parametros_set")))
@@ -2503,7 +2507,14 @@ class MonitorService:
             inicio_dt = _parse_iso_datetime(base.get("inicio_ts"))
             if not inicio_dt:
                 return
-            fim_dt = _parse_iso_datetime(base.get("fim_ts")) or fim_semana
+            # _fmt_ts imprime resolucao de segundos; truncar aqui garante que
+            # duracao e timestamps impressos nunca divirjam por microsegundos
+            # herdados de fim_ts legados gravados com datetime.now().
+            inicio_dt = inicio_dt.replace(microsecond=0)
+            fim_real_dt = _parse_iso_datetime(base.get("fim_ts"))
+            if fim_real_dt:
+                fim_real_dt = fim_real_dt.replace(microsecond=0)
+            fim_dt = fim_real_dt or fim_semana
             if fim_dt < inicio_dt:
                 fim_dt = inicio_dt
             clip_total = _calcular_sobreposicao_segundos(inicio_dt, fim_dt, inicio_semana, fim_semana)
@@ -2537,7 +2548,7 @@ class MonitorService:
                     "tipo_falha": str(base.get("tipo_falha", "")),
                     "equipamento": str(base.get("equipamento", "")),
                     "inicio": inicio_dt,
-                    "fim": _parse_iso_datetime(base.get("fim_ts")),
+                    "fim": fim_real_dt,
                     "clip_ini": clip_ini,
                     "clip_fim": clip_fim,
                     "dur_total_sec": clip_total,
@@ -2819,24 +2830,35 @@ class MonitorService:
                 f"parametros={parametros_base}"
             )
 
-    def _normalizacao_rele_confirmada(self, base: str, reles_normais_por_usina: dict | None) -> bool:
+    def _normalizacao_rele_confirmada(self, base: str, reles_normais_por_usina: dict | None) -> datetime | None:
+        # Retorna a PRIMEIRA leitura limpa posterior ao alerta (ou None):
+        # essa e a evidencia real de normalizacao e o fim do incidente, nao o
+        # horario da varredura nem a ultima leitura limpa processada.
+        # Aceita valor unico (datetime/iso) por compatibilidade com chamadas
+        # que fornecem apenas a leitura limpa mais recente.
         if not reles_normais_por_usina:
-            return False
+            return None
         usina_id, rele_id, _, _ = _partes_chave_rele(base)
         rele_key = (
             _normalizar_campo_chave_rele(usina_id),
             _normalizar_campo_chave_rele(rele_id),
         )
-        ts_normal = reles_normais_por_usina.get(rele_key)
-        if not isinstance(ts_normal, datetime):
-            ts_normal = _parse_iso_datetime(ts_normal)
-        if ts_normal is None:
-            return False
+        leituras = reles_normais_por_usina.get(rele_key)
+        if leituras is None:
+            return None
+        if not isinstance(leituras, (list, tuple)):
+            leituras = [leituras]
         alerta_antigo = self.rele_alerta_chave.get(base) or {}
         ts_alerta = _parse_iso_datetime(alerta_antigo.get("ts_iso"))
         if ts_alerta is None:
-            return False
-        return ts_normal > ts_alerta
+            return None
+        posteriores = []
+        for ts_normal in leituras:
+            if not isinstance(ts_normal, datetime):
+                ts_normal = _parse_iso_datetime(ts_normal)
+            if ts_normal is not None and ts_normal > ts_alerta:
+                posteriores.append(ts_normal)
+        return min(posteriores) if posteriores else None
 
     def _registrar_resolucoes_rele(
         self,
@@ -2847,12 +2869,13 @@ class MonitorService:
         resolvidos_por_usina = {}
         resolved = self.rele_alertas_ativos - bases_ativos_atual
         for base in resolved:
-            if not self._normalizacao_rele_confirmada(base, reles_normais_por_usina):
+            ts_normal = self._normalizacao_rele_confirmada(base, reles_normais_por_usina)
+            if ts_normal is None:
                 logger_rele.debug(
                     f"[RELE] Alerta ativo preservado sem leitura limpa posterior | base={base}"
                 )
                 continue
-            alerta_antigo = self._resolver_alerta_rele(base, fim_ts=agora)
+            alerta_antigo = self._resolver_alerta_rele(base, fim_ts=ts_normal)
             if alerta_antigo:
                 usina_id, rele_id, tipo, _ = _partes_chave_rele(base)
                 resolvidos_por_usina.setdefault(
