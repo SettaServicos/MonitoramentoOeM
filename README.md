@@ -557,6 +557,8 @@ Ao resolver:
 - fecha incidente em `incidentes_rele_ativos`;
 - adiciona incidente encerrado ao histórico.
 
+O `fim_ts` do incidente é a primeira leitura limpa posterior ao alerta — a evidência real de normalização — e não o horário em que a varredura rodou. Para isso, `normais_por_rele` guarda todas as leituras limpas da janela em ordem cronológica: a última serve à supressão de candidatos; a primeira posterior ao alerta fecha o incidente. Esse é o mesmo critério do backfill semanal da API, o que mantém state e relatório consistentes.
+
 ---
 
 ## Monitoramento de inversores
@@ -1030,6 +1032,15 @@ O relatório combina:
 
 Se a coleta da API falhar, o relatório ainda pode ser gerado usando apenas o state local.
 
+Incidentes sobrepostos das duas fontes (mesma usina, equipamento, natureza e tipo) são mesclados pela união dos intervalos: prevalecem o início mais cedo e o fim mais tarde.
+
+### Semântica de tempo e colunas
+
+- Na montagem do relatório, `inicio_ts` e `fim_ts` são truncados para resolução de segundos — a mesma exibida por `_fmt_ts()` — para que a duração impressa nunca divirja dos timestamps impressos por causa de microsegundos em registros legados.
+- `Periodo Considerado (Semana)` e `Indisponibilidade no Periodo` referem-se à parcela do incidente dentro da semana do relatório. Incidentes que atravessam semanas contam em cada relatório apenas a parcela daquela semana, evitando dupla contagem entre relatórios.
+- O `Resumo` agrega essas parcelas por usina, natureza e tipo de falha; `Indisponibilidade Total` significa "total dentro da semana reportada".
+- `Indisponibilidade na Janela Solar` é a interseção da parcela semanal com a janela solar do equipamento (relé `06:00-17:30`; inversor `06:30-17:00`; Ibimirim `07:30-17:00`).
+
 ### Backfill da API
 
 Para reduzir erro na borda da semana, a coleta direta da API busca a semana reportada mais 7 dias de warmup anteriores.
@@ -1193,6 +1204,8 @@ Arquivos:
 |---|---|
 | `tests/test_main.py` | Regras principais de relé, inversor, estado, heartbeat, relatório, Teams e edge cases. |
 | `tests/test_hardening.py` | Retry, 429, falhas de Teams, login e shutdown. |
+| `tests/test_relatorio_indisponibilidade.py` | Regressão do cálculo de indisponibilidade do relatório semanal (casos A-K: clipping semanal, janelas solares, microsegundos, primeira leitura de normalização, merge API x state, mudança de identidade de relé). |
+| `tests/conftest.py` | Stub autouse do Outlook: impede que a suíte autentique na Azure AD e envie e-mail real durante os testes. |
 
 Áreas cobertas:
 
