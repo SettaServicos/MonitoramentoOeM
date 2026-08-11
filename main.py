@@ -34,6 +34,8 @@ from dotenv import load_dotenv
 from requests import Session
 from requests.exceptions import Timeout
 
+from services.outlook_service import OutlookService, WEEKLY_REPORT_RECIPIENT
+
 
 load_dotenv()
 # =========================
@@ -161,6 +163,7 @@ REPORT_DIR.mkdir(parents=True, exist_ok=True)
 # evite reprocessar a borda final da janela (pula 1 segundo além do último fim)
 WINDOW_DELTA_SECONDS = 1
 STATE_SCHEMA_VERSION = 1
+_outlook_service = None
 
 # ---------------------------------------------------------------------------
 # Tipos de dados — puramente documentais, sem efeito em runtime
@@ -356,6 +359,13 @@ def _teams_post_card(
                 return False
             time.sleep(backoff_base * tentativa)
     return False
+
+
+def _get_outlook_service() -> OutlookService:
+    global _outlook_service
+    if _outlook_service is None:
+        _outlook_service = OutlookService()
+    return _outlook_service
 
 
 # Cliente responsavel por autenticar na API PVOperation e expor chamadas encapsuladas.
@@ -2688,6 +2698,31 @@ class MonitorService:
                 text=f"Erro ao escrever arquivo: {e}",
                 severity="warning",
                 facts=[("Arquivo", str(arquivo))],
+            )
+            return False
+
+        try:
+            status_email = _get_outlook_service().send_weekly_report(arquivo, semana_txt)
+            logger.info(
+                "[RELATORIO] Email semanal enviado | status=%s | destinatario=%s | arquivo=%s",
+                status_email,
+                WEEKLY_REPORT_RECIPIENT,
+                arquivo,
+            )
+        except Exception as e:
+            logger.exception("[RELATORIO] Falha ao enviar email do relatorio semanal")
+            _teams_post_card(
+                title="Monitor: falha ao enviar relatório semanal por e-mail",
+                text=(
+                    "O arquivo XLSX foi gerado, mas o envio pelo Outlook falhou. "
+                    "A semana permanecera pendente para nova tentativa."
+                ),
+                severity="warning",
+                facts=[
+                    ("Arquivo", str(arquivo)),
+                    ("Destinatario", WEEKLY_REPORT_RECIPIENT),
+                    ("Erro", f"{type(e).__name__}: {e}"),
+                ],
             )
             return False
 

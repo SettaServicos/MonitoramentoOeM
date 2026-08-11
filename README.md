@@ -76,6 +76,7 @@ O projeto usa poucas dependências externas:
 ```txt
 requests==2.32.3
 python-dotenv
+msal
 ```
 
 Instalação recomendada:
@@ -118,6 +119,16 @@ Variáveis opcionais:
 | `SSL_CERT_FILE` | Bundle CA customizado usado pelo `requests`. |
 | `REQUESTS_CA_BUNDLE` | Alternativa ao `SSL_CERT_FILE`. |
 | `RELE_DEBUG` | Quando `1` (ou `true`/`yes`/`on`), liga logs verbosos do circuito de relé: contagem de estado por varredura, payload bruto enviado ao Teams e resposta recebida. Use apenas para diagnóstico — desligue depois para não inchar `logs/rele/rele.log`. |
+
+Variáveis usadas pelo envio do relatório semanal por Outlook:
+
+| Variável | Descrição |
+|---|---|
+| `client_id` | Client ID da aplicação Azure/MSAL. |
+| `client_secret` | Client secret da aplicação Azure/MSAL. |
+| `authority` | Authority MSAL, normalmente com o tenant da organização. |
+| `scopes` | Escopo Graph usado no client credentials, por exemplo `.default`. |
+| `outlook_sender_id` | ID ou usuário Graph da caixa remetente usada no `sendMail`. |
 
 Exemplo:
 
