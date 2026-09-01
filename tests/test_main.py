@@ -369,17 +369,29 @@ class FakeDayInverterAPI:
         return list(self.payload), False
 
 
-def test_janela_solar_inversor_comeca_as_0630():
-    payload = [
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:00:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:10:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:20:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:30:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:40:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:50:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 07:00:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 07:10:00", "Pac": "0"}},
+def _leituras_inv(inicio_dt, valores_pac, *, inv_id="INV-1", passo_min=10):
+    """Gera leituras de inversor: uma por valor em `valores_pac`, espacadas
+    `passo_min` minutos a partir de `inicio_dt`. Aceita numeros ou strings."""
+    return [
+        {
+            "idinversor": inv_id,
+            "conteudojson": {
+                "tsleitura": (inicio_dt + timedelta(minutes=passo_min * i)).strftime("%Y-%m-%d %H:%M:%S"),
+                "Pac": str(v),
+            },
+        }
+        for i, v in enumerate(valores_pac)
     ]
+
+
+def test_janela_solar_inversor_comeca_as_0630():
+    n = main.INVERTER_CONSECUTIVE_READINGS
+    # 3 leituras zero ANTES da janela (06:00-06:20) devem ser ignoradas;
+    # a falha so pode disparar contando as n leituras zero a partir de 06:30.
+    payload = (
+        _leituras_inv(datetime(2025, 1, 6, 6, 0), ["0", "0", "0"])
+        + _leituras_inv(datetime(2025, 1, 6, 6, 30), ["0"] * n)
+    )
     api = FakeDayInverterAPI(payload)
 
     falhas, recuperados, tem_dados, falhas_ativas, teve_timeout, _ = main.detectar_falhas_inversores(
@@ -395,23 +407,21 @@ def test_janela_solar_inversor_comeca_as_0630():
     assert recuperados == []
     assert len(falhas) == 1
     assert falhas[0]["inversor_id"] == "INV-1"
-    assert falhas[0]["ts_leitura"] == datetime(2025, 1, 6, 6, 50, 0)
+    # dispara exatamente na n-esima leitura dentro da janela (nao nas de antes)
+    assert falhas[0]["ts_leitura"] == datetime(2025, 1, 6, 6, 30) + timedelta(minutes=10 * (n - 1))
     assert falhas_ativas["1:INV-1"]["ativa"] is True
 
 
 def test_janela_solar_inversor_ibimirim_comeca_as_0730():
-    payload = [
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:00:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:10:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:20:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 07:30:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 07:40:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 07:50:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 08:00:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 08:10:00", "Pac": "0"}},
-    ]
-    api = FakeDayInverterAPI(payload)
+    n = main.INVERTER_CONSECUTIVE_READINGS
     janela_inicio, janela_fim = main._obter_janela_solar_inversor("Usina IBIMIRIM 1")
+    # leituras antes de 07:30 nao contam para Ibimirim; a falha so dispara
+    # contando as n leituras zero a partir de 07:30.
+    payload = (
+        _leituras_inv(datetime(2025, 1, 6, 6, 0), ["0", "0", "0"])
+        + _leituras_inv(datetime(2025, 1, 6, 7, 30), ["0"] * n)
+    )
+    api = FakeDayInverterAPI(payload)
 
     falhas, recuperados, tem_dados, falhas_ativas, teve_timeout, _ = main.detectar_falhas_inversores(
         api=api,
@@ -427,7 +437,7 @@ def test_janela_solar_inversor_ibimirim_comeca_as_0730():
     assert teve_timeout is False
     assert recuperados == []
     assert len(falhas) == 1
-    assert falhas[0]["ts_leitura"] == datetime(2025, 1, 6, 7, 50, 0)
+    assert falhas[0]["ts_leitura"] == datetime(2025, 1, 6, 7, 30) + timedelta(minutes=10 * (n - 1))
     assert falhas_ativas["1:INV-1"]["ativa"] is True
 
 
@@ -859,11 +869,11 @@ def test_pac_negativo_nao_conta_como_recuperacao():
 
 
 def test_sequencia_zero_negativo_zero_dispara_falha():
-    payload = [
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:30:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:40:00", "Pac": "-1.0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:50:00", "Pac": "0"}},
-    ]
+    n = main.INVERTER_CONSECUTIVE_READINGS
+    # Pac negativo conta como "zerado" e nao reseta a sequencia de falha:
+    # alterna 0 e -1.0 pelas n leituras e ainda assim dispara.
+    valores = [("0" if i % 2 == 0 else "-1.0") for i in range(n)]
+    payload = _leituras_inv(datetime(2025, 1, 6, 6, 30), valores)
     api = FakeDayInverterAPI(payload)
 
     falhas, _, _, falhas_ativas, _, _ = main.detectar_falhas_inversores(
@@ -1891,31 +1901,31 @@ def test_log_sem_dados_inversor_diferencia_multiplos_seriais(state_file, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# T6 — seq_zero carregado entre janelas de varredura dispara falha na 3ª leitura
+# T6 — seq_zero carregado entre janelas de varredura dispara falha
 # ---------------------------------------------------------------------------
 
 def test_seq_zero_carregado_entre_janelas_dispara_falha():
-    payload1 = [
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:30:00", "Pac": "0"}},
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:40:00", "Pac": "0"}},
-    ]
+    n = main.INVERTER_CONSECUTIVE_READINGS
+    passo = timedelta(minutes=10)
+    base = datetime(2025, 1, 6, 6, 30)
+
+    # scan 1: n-1 leituras zero na janela -> seq_zero = n-1, ainda sem falha
     falhas1, _, _, falhas_ativas1, _, _ = main.detectar_falhas_inversores(
-        api=FakeDayInverterAPI(payload1),
+        api=FakeDayInverterAPI(_leituras_inv(base, ["0"] * (n - 1))),
         plant_id="1",
         inicio=datetime(2025, 1, 6, 6, 0, 0),
-        fim=datetime(2025, 1, 6, 6, 45, 0),
+        fim=base + passo * (n - 1),
         falhas_ativas_previas={},
     )
     assert falhas1 == []
-    assert falhas_ativas1["1:INV-1"]["seq_zero"] == 2
+    assert falhas_ativas1["1:INV-1"]["seq_zero"] == n - 1
 
-    payload2 = [
-        {"idinversor": "INV-1", "conteudojson": {"tsleitura": "2025-01-06 06:50:00", "Pac": "0"}},
-    ]
+    # scan 2: mais 1 leitura zero -> seq_zero = n -> dispara
+    ts_next = base + passo * (n - 1)
     falhas2, _, _, _, _, _ = main.detectar_falhas_inversores(
-        api=FakeDayInverterAPI(payload2),
+        api=FakeDayInverterAPI(_leituras_inv(ts_next, ["0"])),
         plant_id="1",
-        inicio=datetime(2025, 1, 6, 6, 41, 0),
+        inicio=ts_next - passo,
         fim=datetime(2025, 1, 6, 23, 59, 59),
         falhas_ativas_previas=falhas_ativas1,
     )
