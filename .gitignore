@@ -43,6 +43,20 @@ monitor_state*.json*
 .pytest_cache/
 state/
 artifacts/
+reports/
+
+# Databases locais
+*.db
+*.sqlite
+*.sqlite3
+
+# Backups locais
+*.bak
+*.bak_*
+
+# Capturas locais da API e imagens avulsas (nao versionar)
+API/
+relé.jpg
 
 # Cleanup staging (generated only)
 deletar/generated/
