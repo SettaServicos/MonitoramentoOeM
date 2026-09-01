@@ -45,6 +45,10 @@ PVOP_BASE_URL = os.environ.get("PVOP_BASE_URL", "https://apipv.pvoperation.com.b
 PVOP_EMAIL = os.environ.get("MONITOR_EMAIL", "").strip()
 PVOP_PASSWORD = os.environ.get("MONITOR_PASSWORD", "").strip()
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "").strip()
+# Canais dedicados. Se a variável específica não estiver no ambiente/.env,
+# cai para TEAMS_WEBHOOK_URL — permite implantação incremental sem perder alerta.
+TEAMS_WEBHOOK_URL_RELE = os.environ.get("TEAMS_WEBHOOK_URL_RELE", "").strip() or TEAMS_WEBHOOK_URL
+TEAMS_WEBHOOK_URL_INVERSOR = os.environ.get("TEAMS_WEBHOOK_URL_INVERSOR", "").strip() or TEAMS_WEBHOOK_URL
 TEAMS_ENABLED = bool(TEAMS_WEBHOOK_URL)
 # Diagnostico extra do circuito de rele. Ative com RELE_DEBUG=1 no .env
 # para gerar logs detalhados (payload Teams, contagens de estado, motivo
@@ -288,10 +292,14 @@ def _teams_post_card(
     severity: SeverityLevel = "info",
     facts: list[tuple[str, str]] | None = None,
     max_tentativas: int = 3,
+    webhook_url: str | None = None,
 ) -> bool:
     """Envia um 'MessageCard' para um Incoming Webhook do Microsoft Teams."""
     if not TEAMS_ENABLED:
         return False
+
+    # webhook_url explícito tem prioridade; senão usa o canal geral.
+    url = webhook_url or TEAMS_WEBHOOK_URL
 
     colors = {"info": "0078D4", "warning": "FFA000", "danger": "D13438"}
     payload = {
@@ -315,7 +323,7 @@ def _teams_post_card(
     for tentativa in range(1, max_tentativas + 1):
         try:
             r = _teams_session.post(
-                TEAMS_WEBHOOK_URL,
+                url,
                 data=payload_bytes,
                 headers={"Content-Type": "application/json"},
                 timeout=10,
@@ -3501,7 +3509,7 @@ class MonitorService:
                 )
                 try:
                     # Mesma politica de retry do inversor (default 3 tentativas).
-                    ok_novos = _teams_post_card(**card)
+                    ok_novos = _teams_post_card(**card, webhook_url=TEAMS_WEBHOOK_URL_RELE)
                 except Exception:
                     logger_rele.exception("Falha ao notificar Teams (rele falha)")
                     ok_novos = False
@@ -3528,7 +3536,7 @@ class MonitorService:
                     f"bases={[i.get('base') for i in normalizados]}"
                 )
                 try:
-                    ok_norm = _teams_post_card(**card)
+                    ok_norm = _teams_post_card(**card, webhook_url=TEAMS_WEBHOOK_URL_RELE)
                 except Exception:
                     logger_rele.exception("Falha ao notificar Teams (rele normalizacao)")
                     ok_norm = False
@@ -3563,6 +3571,7 @@ class MonitorService:
                 text=_formatar_corpo_card_inversor(alerta, detalhes_txt),
                 severity="danger",
                 facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
+                webhook_url=TEAMS_WEBHOOK_URL_INVERSOR,
             )
         except Exception:
             logger_inv.exception("Falha ao notificar Teams (inversor)")
@@ -3578,6 +3587,7 @@ class MonitorService:
                 text=_formatar_corpo_card_inversor(alerta, detalhes_txt),
                 severity="info",
                 facts=[("Capacidade", f"{alerta['capacidade']} kWp")],
+                webhook_url=TEAMS_WEBHOOK_URL_INVERSOR,
             )
         except Exception:
             logger_inv.exception("Falha ao notificar Teams (recuperacao inversor)")

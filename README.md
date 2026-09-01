@@ -110,7 +110,7 @@ Variáveis obrigatórias:
 | `PVOP_BASE_URL` | URL base da API PVOperation. Padrão de fallback: `https://apipv.pvoperation.com.br/api/v1`. |
 | `MONITOR_EMAIL` | Usuário usado no `/authenticate`. |
 | `MONITOR_PASSWORD` | Senha usada no `/authenticate`. |
-| `TEAMS_WEBHOOK_URL` | Incoming Webhook do Teams. |
+| `TEAMS_WEBHOOK_URL` | Incoming Webhook do Teams (canal geral: heartbeat + erros de sistema). É também o fallback dos canais dedicados. |
 
 Variáveis opcionais:
 
@@ -118,6 +118,8 @@ Variáveis opcionais:
 |---|---|
 | `SSL_CERT_FILE` | Bundle CA customizado usado pelo `requests`. |
 | `REQUESTS_CA_BUNDLE` | Alternativa ao `SSL_CERT_FILE`. |
+| `TEAMS_WEBHOOK_URL_RELE` | Webhook do canal dedicado a alertas de relé. Se ausente, usa `TEAMS_WEBHOOK_URL`. |
+| `TEAMS_WEBHOOK_URL_INVERSOR` | Webhook do canal dedicado a alertas de inversor. Se ausente, usa `TEAMS_WEBHOOK_URL`. |
 | `RELE_DEBUG` | Quando `1` (ou `true`/`yes`/`on`), liga logs verbosos do circuito de relé: contagem de estado por varredura, payload bruto enviado ao Teams e resposta recebida. Use apenas para diagnóstico — desligue depois para não inchar `logs/rele/rele.log`. |
 
 Variáveis usadas pelo envio do relatório semanal por Outlook:
@@ -769,6 +771,18 @@ Severidades:
 | `info` | `0078D4` |
 | `warning` | `FFA000` |
 | `danger` | `D13438` |
+
+### Roteamento por canal
+
+Cada envio vai para um webhook conforme a natureza do alerta:
+
+| Origem | Variável | Canal Teams |
+|---|---|---|
+| Falha / normalização de relé | `TEAMS_WEBHOOK_URL_RELE` | `RELÉS` |
+| Falha / normalização de inversor | `TEAMS_WEBHOOK_URL_INVERSOR` | `INVERSORES` |
+| Heartbeat, falha ao salvar estado, falha no relatório semanal | `TEAMS_WEBHOOK_URL` | `HEARTBEAT` (canal geral) |
+
+`_teams_post_card()` aceita `webhook_url`. Quando não recebe, usa `TEAMS_WEBHOOK_URL`. As duas variáveis dedicadas são resolvidas no import: se não estiverem no ambiente, viram cópia de `TEAMS_WEBHOOK_URL` — nada é perdido durante uma implantação incremental.
 
 ### Política de retry
 
