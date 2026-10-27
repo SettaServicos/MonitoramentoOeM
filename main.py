@@ -190,6 +190,7 @@ class EstadoInversor(TypedDict):
     notificado: bool
     ausente_scans: int
     ultima_confirmacao_ts: str | None
+    serial: str | None
 
 
 class Incidente(TypedDict):
@@ -838,6 +839,8 @@ def _formatar_texto_heartbeat(
     rele_usinas: list,
     inv_usina_counts: dict,
     previsto: datetime,
+    inv_detalhes: dict | None = None,
+    inv_sem_confirmacao: list | None = None,
 ) -> str:
     bullet_prefix = "    • "
     info = [
@@ -858,6 +861,14 @@ def _formatar_texto_heartbeat(
     info.append(f"**Alertas de inversor ativos: {ativos_inv}**")
     for nome in sorted(inv_usina_counts):
         info.append(f"{bullet_prefix}{nome} ({inv_usina_counts[nome]})")
+        for detalhe in sorted((inv_detalhes or {}).get(nome, [])):
+            info.append(f"{bullet_prefix}{detalhe}")
+    if inv_sem_confirmacao:
+        info.append("")
+        info.append(f"**Inversores sem confirmação recente: {len(inv_sem_confirmacao)}**")
+        info.append("Falhas anteriores pendentes de validação; ausência de dados não confirma recuperação.")
+        for detalhe in sorted(inv_sem_confirmacao):
+            info.append(f"{bullet_prefix}{detalhe}")
     return "  \n".join(info)
 
 
@@ -1109,6 +1120,7 @@ def detectar_falhas_inversores(
     janela_fim: dtime = INVERTER_SOLAR_WINDOW_END,
 ):
     leituras_por_inv = {}
+    seriais_por_inv = {}
     tem_dados = False
     tem_resposta = False
     tem_registro_api = False
@@ -1141,6 +1153,9 @@ def detectar_falhas_inversores(
             if not (janela_inicio <= ts.time() <= janela_fim):
                 continue
 
+            serial = conteudo_raw.get("esn") or conteudo_raw.get("Inversor")
+            if serial:
+                seriais_por_inv[inv_id] = str(serial).strip()
             pac_raw = None
             for k in ("Pac", "PAC", "Potencia_Saida", "Pout", "Potencia"):
                 if k in conteudo_raw:
@@ -1240,6 +1255,7 @@ def detectar_falhas_inversores(
                 ultima_confirmacao_dt = None
 
         falhas_ativas[state_key] = {
+            "serial": seriais_por_inv.get(inv_id) or prev_state.get("serial"),
             "ativa": ativa,
             "rec_seq": rec_seq,
             "seq_zero": seq_zero,
@@ -1370,6 +1386,7 @@ def _alerta_ts_key(item: dict) -> datetime:
 
 def _compor_entrada_estado_inversor(prev_entry: dict, estado_novo: dict, tem_dado_valido: bool) -> EstadoInversor:
     entry = {
+        "serial": estado_novo.get("serial") or prev_entry.get("serial"),
         "ativa": bool(estado_novo.get("ativa", False)),
         "rec_seq": int(estado_novo.get("rec_seq", 0)),
         "seq_zero": int(estado_novo.get("seq_zero", 0)),
@@ -1990,6 +2007,7 @@ class MonitorService:
                     if not isinstance(estado, dict):
                         continue
                     self.estado_inversores[str(chave)] = {
+                        "serial": estado.get("serial"),
                         "ativa": bool(estado.get("ativa", False)),
                         "rec_seq": int(estado.get("rec_seq", 0)),
                         "seq_zero": int(estado.get("seq_zero", 0)),
@@ -2030,18 +2048,6 @@ class MonitorService:
                         entry["ausente_scans"] = int(entry.get("ausente_scans", 0))
                         entry["ultima_confirmacao_ts"] = entry.get("ultima_confirmacao_ts")
                         self.estado_inversores[estado_key] = entry
-
-            for chave, estado in self.estado_inversores.items():
-                if (
-                    estado.get("ativa")
-                    and _parse_iso_datetime(estado.get("ultima_confirmacao_ts")) is None
-                    and int(estado.get("ausente_scans", 0)) < INVERTER_MISSING_SCAN_TOLERANCE
-                ):
-                    usina_id = chave.split(":", 1)[0] if ":" in chave else None
-                    if usina_id:
-                        varredura_dt = self.ultima_varredura_inversor_por_usina.get(str(usina_id))
-                        if varredura_dt:
-                            estado["ultima_confirmacao_ts"] = varredura_dt.isoformat()
 
             for base in list(self.rele_alertas_ativos):
                 if base in self.incidentes_rele_ativos:
@@ -3394,9 +3400,12 @@ class MonitorService:
 
     @staticmethod
     def _inversor_conta_no_heartbeat(estado: dict, referencia: datetime) -> bool:
-        if not isinstance(estado, dict):
+        if not isinstance(estado, dict) or not estado.get("ativa"):
             return False
-        return bool(estado.get("ativa"))
+        if int(estado.get("ausente_scans", 0)) >= INVERTER_MISSING_SCAN_TOLERANCE:
+            return False
+        confirmacao = _parse_iso_datetime(estado.get("ultima_confirmacao_ts"))
+        return bool(confirmacao and timedelta(0) <= referencia - confirmacao <= timedelta(seconds=2 * INVERTER_INTERVAL))
 
     @staticmethod
     def _proximo_horario_heartbeat(ref: datetime) -> datetime:
@@ -3418,7 +3427,10 @@ class MonitorService:
             lock_wait = time.monotonic() - _wait_t0
             rele_alertas = list(self.rele_alertas_ativos)
             rele_alerta_chave = dict(self.rele_alerta_chave)
-            estado_inversores = dict(self.estado_inversores)
+            estado_inversores = {
+                chave: {**estado, "alerta": dict(estado.get("alerta") or {})}
+                for chave, estado in self.estado_inversores.items() if isinstance(estado, dict)
+            }
             ativos_rele = len(rele_alertas)
             ativos_inv = sum(
                 1 for estado in estado_inversores.values() if self._inversor_conta_no_heartbeat(estado, referencia_hb)
@@ -3449,9 +3461,11 @@ class MonitorService:
             rele_usinas = sorted(set(rele_usinas))
 
         inv_usina_counts = {}
-        if ativos_inv:
+        inv_detalhes = {}
+        inv_sem_confirmacao = []
+        if estado_inversores:
             for chave, estado in estado_inversores.items():
-                if not self._inversor_conta_no_heartbeat(estado, referencia_hb):
+                if not estado.get("ativa"):
                     continue
                 alerta = estado.get("alerta") or {}
                 nome = alerta.get("usina")
@@ -3459,7 +3473,15 @@ class MonitorService:
                     nome = f"Usina {chave.split(':', 1)[0]}"
                 if not nome:
                     continue
+                serial = estado.get("serial") or alerta.get("serial") or alerta.get("inversor") or str(chave).split(":", 1)[-1]
+                confirmacao = _parse_iso_datetime(estado.get("ultima_confirmacao_ts"))
+                horario = confirmacao.strftime('%d/%m/%Y %H:%M:%S') if confirmacao else 'N/D'
+                detalhe = f"Série: {serial} — Última confirmação de falha: {horario}"
+                if not self._inversor_conta_no_heartbeat(estado, referencia_hb):
+                    inv_sem_confirmacao.append(f"{nome} — {detalhe}")
+                    continue
                 inv_usina_counts[nome] = inv_usina_counts.get(nome, 0) + 1
+                inv_detalhes.setdefault(nome, []).append(detalhe)
 
         texto = _formatar_texto_heartbeat(
             rele_atrasado=rele_atrasado,
@@ -3470,6 +3492,8 @@ class MonitorService:
             ativos_inv=ativos_inv,
             rele_usinas=rele_usinas,
             inv_usina_counts=inv_usina_counts,
+            inv_detalhes=inv_detalhes,
+            inv_sem_confirmacao=inv_sem_confirmacao,
             previsto=previsto,
         )
         heartbeat_line = texto.replace("  \n", " | ")
