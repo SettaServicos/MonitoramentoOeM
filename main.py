@@ -3438,12 +3438,8 @@ class MonitorService:
 
     @staticmethod
     def _inversor_conta_no_heartbeat(estado: dict, referencia: datetime) -> bool:
-        if not isinstance(estado, dict) or not estado.get("ativa"):
-            return False
-        if estado.get("ultima_leitura_pac") != 0:
-            return False
-        leitura = _parse_iso_datetime(estado.get("ultima_leitura_ts"))
-        return bool(leitura and timedelta(0) <= referencia - leitura <= timedelta(seconds=2 * INVERTER_INTERVAL))
+        # A detecção decide abertura/recuperação; idade da leitura não encerra falha.
+        return isinstance(estado, dict) and bool(estado.get("ativa"))
 
     @staticmethod
     def _proximo_horario_heartbeat(ref: datetime) -> datetime:
@@ -3459,6 +3455,18 @@ class MonitorService:
 
     # Envia notificacao de heartbeat/saude em horarios fixos.
     def _enviar_heartbeat(self, previsto: datetime):
+        # As varreduras adquirem o próprio lock. Atualizar antes do snapshot,
+        # na mesma ordem do loop central, preserva a hierarquia relé/inversor.
+        erros_atualizacao = []
+        for nome, varredura in (
+            ("relé", self.executar_varredura_rele),
+            ("inversor", self.executar_varredura_inversor),
+        ):
+            try:
+                varredura()
+            except Exception:
+                erros_atualizacao.append(nome)
+                logger.exception("Falha ao atualizar %s antes do heartbeat", nome)
         _wait_t0 = time.monotonic()
         with self._scan_lock:
             lock_wait = time.monotonic() - _wait_t0
@@ -3512,8 +3520,10 @@ class MonitorService:
                     continue
                 serial = estado.get("serial") or alerta.get("serial") or alerta.get("inversor") or str(chave).split(":", 1)[-1]
                 leitura = _parse_iso_datetime(estado.get("ultima_leitura_ts"))
-                horario = leitura.strftime('%d/%m/%Y %H:%M:%S')
-                detalhe = f"Série: {serial} — 0 kW — Última leitura: {horario}"
+                horario = leitura.strftime('%d/%m/%Y %H:%M:%S') if leitura else "N/D"
+                pac = estado.get("ultima_leitura_pac")
+                potencia = f"{pac:g} kW" if isinstance(pac, (int, float)) else "N/D"
+                detalhe = f"Série: {serial} — Última potência: {potencia} — Última leitura: {horario}"
                 inv_usina_counts[nome] = inv_usina_counts.get(nome, 0) + 1
                 inv_detalhes.setdefault(nome, []).append(detalhe)
 
@@ -3529,6 +3539,8 @@ class MonitorService:
             inv_detalhes=inv_detalhes,
             previsto=previsto,
         )
+        if erros_atualizacao:
+            texto += "  \n⚠️ Falha na atualização: " + ", ".join(erros_atualizacao) + ". Exibindo estados conhecidos."
         heartbeat_line = texto.replace("  \n", " | ")
         logger.info(f"[HEARTBEAT] {heartbeat_line}")
         try:
