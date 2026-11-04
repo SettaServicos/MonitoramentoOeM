@@ -842,11 +842,13 @@ def _formatar_texto_heartbeat(
     inv_usina_counts: dict,
     previsto: datetime,
     inv_detalhes: dict | None = None,
+    inv_sem_dados: dict | None = None,
 ) -> str:
     bullet_prefix = "    • "
     info = [
         "Heartbeat: monitor rodando",
-        "Status: OK" if not (rele_atrasado or inv_atrasado) else "Status: SCAN ATRASADO",
+        ("Varreduras: SCAN ATRASADO" if rele_atrasado or inv_atrasado else
+         "Varreduras: em dia" if ultima_rele and ultima_inv else "Varreduras: sem registro completo"),
         *(["⚠️ Scan de relé atrasado"] if rele_atrasado else []),
         *(["⚠️ Scan de inversor atrasado"] if inv_atrasado else []),
         f"Última varredura relé: {ultima_rele.strftime('%d/%m %H:%M:%S') if ultima_rele else 'N/D'}",
@@ -859,11 +861,18 @@ def _formatar_texto_heartbeat(
     for nome in rele_usinas:
         info.append(f"{bullet_prefix}{nome}")
     info.append("")
-    info.append(f"**Alertas de inversor ativos: {ativos_inv}**")
+    info.append(f"**Falhas de inversor confirmadas: {ativos_inv}**")
     for nome in sorted(inv_usina_counts):
         info.append(f"{bullet_prefix}{nome} ({inv_usina_counts[nome]})")
         for detalhe in sorted((inv_detalhes or {}).get(nome, [])):
             info.append(f"{bullet_prefix}{detalhe}")
+    info.append("")
+    info.append(f"**Falhas anteriores sem dados recentes: {sum(len(itens) for itens in (inv_sem_dados or {}).values())}**")
+    if inv_sem_dados:
+        info.append("Aguardando atualização; fora da contagem de falhas confirmadas.")
+        for nome, detalhes in sorted(inv_sem_dados.items()):
+            info.append(f"{bullet_prefix}{nome} ({len(detalhes)})")
+            info.extend(f"{bullet_prefix}{detalhe}" for detalhe in sorted(detalhes))
     return "  \n".join(info)
 
 
@@ -1479,6 +1488,7 @@ class MonitorService:
         self.incidentes_inv_ativos = {}       # usina:inv -> incidente aberto
         self.historico_incidentes = []        # incidentes concluídos (relé e inversor)
         self.last_weekly_report_id = None
+        self.ultimo_heartbeat_enviado = None  # horário previsto do último envio aceito
         self._last_historico_cleanup = None   # throttle: evita varredura completa a cada save
         self._plants_cache = None             # cache da lista de usinas entre relay e inversor scan
         self._plants_cache_ts = None
@@ -1955,6 +1965,7 @@ class MonitorService:
                 datetime.fromisoformat(data.get("ultima_varredura_inversor"))
                 if data.get("ultima_varredura_inversor") else None
             )
+            self.ultimo_heartbeat_enviado = _parse_iso_datetime(data.get("ultimo_heartbeat_enviado"))
             self.ultima_varredura_rele_por_usina = self._carregar_varredura_por_usina(
                 data.get("ultima_varredura_rele_por_usina", {})
             )
@@ -2164,6 +2175,7 @@ class MonitorService:
                 "incidentes_inv_ativos": self.incidentes_inv_ativos,
                 "historico_incidentes": self.historico_incidentes,
                 "last_weekly_report_id": self.last_weekly_report_id,
+                "ultimo_heartbeat_enviado": self.ultimo_heartbeat_enviado.isoformat() if self.ultimo_heartbeat_enviado else None,
             }
             tmp_path = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
             with self._state_lock:
@@ -2217,14 +2229,20 @@ class MonitorService:
     def _loop_heartbeat(self):
         while not self.stop_event.is_set():
             agora = datetime.now()
-            proximo = self._proximo_horario_heartbeat(agora)
-            espera = max(1, (proximo - agora).total_seconds())
-            if self.stop_event.wait(espera):
-                break
+            proximo = self._horario_heartbeat_pendente(agora)
+            if proximo is None:
+                # Avança um microssegundo para não selecionar novamente o slot já enviado.
+                futuro = self._proximo_horario_heartbeat(agora + timedelta(microseconds=1))
+                if self.stop_event.wait(max(1, (futuro - agora).total_seconds())):
+                    break
+                continue
             try:
-                self._enviar_heartbeat(proximo)
+                enviado = self._enviar_heartbeat(proximo)
             except Exception:
                 logger.exception("Erro ao enviar heartbeat")
+                enviado = False
+            if not enviado and self.stop_event.wait(60):
+                break
 
     # Loop dedicado para gerar relatório semanal de forma automática.
     def _loop_weekly_report(self):
@@ -3438,8 +3456,29 @@ class MonitorService:
 
     @staticmethod
     def _inversor_conta_no_heartbeat(estado: dict, referencia: datetime) -> bool:
-        # A detecção decide abertura/recuperação; idade da leitura não encerra falha.
-        return isinstance(estado, dict) and bool(estado.get("ativa"))
+        # Apenas apresentação: não encerra incidentes nem altera os contadores.
+        if not isinstance(estado, dict) or not estado.get("ativa"):
+            return False
+        leitura = _parse_iso_datetime(estado.get("ultima_leitura_ts"))
+        pac = estado.get("ultima_leitura_pac")
+        if leitura is None or leitura > referencia or not isinstance(pac, (int, float)):
+            return False
+        inicio, fim = _obter_janela_solar_inversor((estado.get("alerta") or {}).get("usina"))
+        if not inicio <= leitura.time() <= fim:
+            return False
+        # O relógio de atualização só avança na janela de geração da usina.
+        idade_solar = _calcular_sobreposicao_janela_solar(leitura, referencia, inicio, fim)
+        return idade_solar <= 2 * INVERTER_INTERVAL
+
+    def _horario_heartbeat_pendente(self, referencia: datetime) -> datetime | None:
+        """Recupera apenas o último slot vencido, sem disparar uma fila de cards antigos."""
+        vencidos = [datetime.combine(referencia.date(), t) for t in HEARTBEAT_TIMES
+                    if datetime.combine(referencia.date(), t) <= referencia]
+        ultimo = max(vencidos) if vencidos else datetime.combine(
+            referencia.date() - timedelta(days=1), HEARTBEAT_TIMES[-1])
+        if self.ultimo_heartbeat_enviado is None or self.ultimo_heartbeat_enviado < ultimo:
+            return ultimo
+        return None
 
     @staticmethod
     def _proximo_horario_heartbeat(ref: datetime) -> datetime:
@@ -3454,7 +3493,7 @@ class MonitorService:
         return datetime.combine(amanha, HEARTBEAT_TIMES[0])
 
     # Envia notificacao de heartbeat/saude em horarios fixos.
-    def _enviar_heartbeat(self, previsto: datetime):
+    def _enviar_heartbeat(self, previsto: datetime) -> bool:
         # As varreduras adquirem o próprio lock. Atualizar antes do snapshot,
         # na mesma ordem do loop central, preserva a hierarquia relé/inversor.
         erros_atualizacao = []
@@ -3508,9 +3547,10 @@ class MonitorService:
 
         inv_usina_counts = {}
         inv_detalhes = {}
+        inv_sem_dados = {}
         if estado_inversores:
             for chave, estado in estado_inversores.items():
-                if not self._inversor_conta_no_heartbeat(estado, referencia_hb):
+                if not estado.get("ativa"):
                     continue
                 alerta = estado.get("alerta") or {}
                 nome = alerta.get("usina")
@@ -3520,12 +3560,21 @@ class MonitorService:
                     continue
                 serial = estado.get("serial") or alerta.get("serial") or alerta.get("inversor") or str(chave).split(":", 1)[-1]
                 leitura = _parse_iso_datetime(estado.get("ultima_leitura_ts"))
-                horario = leitura.strftime('%d/%m/%Y %H:%M:%S') if leitura else "N/D"
                 pac = estado.get("ultima_leitura_pac")
-                potencia = f"{pac:g} kW" if isinstance(pac, (int, float)) else "N/D"
-                detalhe = f"Série: {serial} — Última potência: {potencia} — Última leitura: {horario}"
-                inv_usina_counts[nome] = inv_usina_counts.get(nome, 0) + 1
-                inv_detalhes.setdefault(nome, []).append(detalhe)
+                confirmada = self._inversor_conta_no_heartbeat(estado, referencia_hb)
+                dados = []
+                if isinstance(pac, (int, float)):
+                    dados.append(f"{pac:g} kW")
+                if leitura:
+                    dados.append(leitura.strftime('%d/%m/%Y %H:%M:%S'))
+                detalhe = f"Série: {serial}" + (" — Última leitura: " + " · ".join(dados) if dados else " — Sem leitura disponível")
+                if confirmada:
+                    if pac > 0:
+                        detalhe += " — Recuperação em confirmação"
+                    inv_usina_counts[nome] = inv_usina_counts.get(nome, 0) + 1
+                    inv_detalhes.setdefault(nome, []).append(detalhe)
+                else:
+                    inv_sem_dados.setdefault(nome, []).append(detalhe)
 
         texto = _formatar_texto_heartbeat(
             rele_atrasado=rele_atrasado,
@@ -3537,6 +3586,7 @@ class MonitorService:
             rele_usinas=rele_usinas,
             inv_usina_counts=inv_usina_counts,
             inv_detalhes=inv_detalhes,
+            inv_sem_dados=inv_sem_dados,
             previsto=previsto,
         )
         if erros_atualizacao:
@@ -3544,14 +3594,22 @@ class MonitorService:
         heartbeat_line = texto.replace("  \n", " | ")
         logger.info(f"[HEARTBEAT] {heartbeat_line}")
         try:
-            _teams_post_card(
+            enviado = _teams_post_card(
                 title="Heartbeat: monitor rodando",
                 text=texto,
                 severity="info",
                 facts=None,
             )
+            if enviado:
+                with self._scan_lock:
+                    self.ultimo_heartbeat_enviado = max(self.ultimo_heartbeat_enviado, previsto) if self.ultimo_heartbeat_enviado else previsto
+                    self._save_state()
+                logger.info("[HEARTBEAT] Envio aceito para o horário %s", previsto.isoformat())
+                return True
+            logger.warning("[HEARTBEAT] Envio não confirmado para %s; permanece pendente", previsto.isoformat())
         except Exception:
             logger.exception("Falha ao enviar heartbeat")
+        return False
 
     # Monta e envia notificacao de falha/normalizacao de relé por usina.
     def _notificar_rele_agrupado(self, pacote: dict) -> tuple[bool, bool]:
