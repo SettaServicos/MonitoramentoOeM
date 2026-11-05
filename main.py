@@ -10,6 +10,7 @@
 import atexit
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -22,7 +23,7 @@ from datetime import datetime
 from datetime import time as dtime
 from datetime import timedelta
 from email.utils import parsedate_to_datetime
-from functools import lru_cache
+from functools import lru_cache, wraps
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from statistics import median
@@ -1149,18 +1150,19 @@ def detectar_falhas_inversores(
     tem_resposta = False
     tem_registro_api = False
     teve_timeout = False
+    ultimo_dia_incompleto = None
     max_ts_processado = None
 
     d = inicio.date()
     while d <= fim.date():
         data_resp, timeout_flag = api.post_day("day_inverter", int(plant_id), datetime.combine(d, datetime.min.time()))
-        if timeout_flag or getattr(api, "last_post_day_error", False):
+        if (timeout_flag or getattr(api, "last_post_day_error", False)
+                or not isinstance(data_resp, list)):
             teve_timeout = True
-        if data_resp is None:
-            d += timedelta(days=1)
-            continue
-        if not isinstance(data_resp, list):
-            logger_inv.warning(f"Resposta inesperada em day_inverter (usina {plant_id}): {type(data_resp).__name__}")
+            ultimo_dia_incompleto = d
+            # Nenhuma leitura de um dia com erro e usada. Leituras de dias
+            # anteriores sao preservadas (relatorio semanal); a virada de data
+            # ja impede unir sequencias atraves do dia com erro.
             d += timedelta(days=1)
             continue
         tem_resposta = True
@@ -1182,9 +1184,6 @@ def detectar_falhas_inversores(
                         inv_id = candidato
             if not (inicio <= ts <= fim):
                 continue
-            if not (janela_inicio <= ts.time() <= janela_fim):
-                continue
-
             if serial:
                 seriais_por_inv[inv_id] = str(serial).strip()
             pac_raw = None
@@ -1198,7 +1197,7 @@ def detectar_falhas_inversores(
                 continue
 
             pac = extrair_valor_numerico(pac_raw)
-            if pac is None:
+            if pac is None or not math.isfinite(pac):
                 leituras_por_inv.setdefault(inv_id, []).append({"ts": ts, "pac_zero": False, "sem_dados": True, "pac": None})
                 continue
 
@@ -1208,6 +1207,29 @@ def detectar_falhas_inversores(
             if max_ts_processado is None or ts > max_ts_processado:
                 max_ts_processado = ts
         d += timedelta(days=1)
+
+    # Leituras exclusivamente noturnas de um equipamento sem falha nao
+    # participam da deteccao. Se houve dados solares, manter a cauda permite
+    # confirmar uma recuperacao na mesma consulta, mesmo com API fora de ordem.
+    for inv, leituras in list(leituras_por_inv.items()):
+        anterior = falhas_ativas_previas.get(f"{plant_id}:{inv}", {})
+        ativa_anterior = anterior.get("ativa") if isinstance(anterior, dict) else bool(anterior)
+        tem_leitura_solar = any(janela_inicio <= item["ts"].time() <= janela_fim for item in leituras)
+        if not ativa_anterior and not tem_leitura_solar:
+            del leituras_por_inv[inv]
+    timestamps_validos = [
+        item["ts"] for leituras in leituras_por_inv.values()
+        for item in leituras if not item["sem_dados"]
+    ]
+    tem_dados = bool(timestamps_validos)
+    max_ts_processado = max(timestamps_validos, default=None)
+    if ultimo_dia_incompleto is not None and ultimo_dia_incompleto < fim.date() and tem_dados:
+        logger_inv.warning(
+            "Historico incompleto de inversor na usina %s (ultimo dia com erro: %s); "
+            "dias com erro foram ignorados e as sequencias nao atravessam a lacuna.",
+            plant_id, ultimo_dia_incompleto,
+        )
+        teve_timeout = False
 
     falhas = []
     recuperados = []
@@ -1246,20 +1268,31 @@ def detectar_falhas_inversores(
             checkpoint = ultima_confirmacao_dt or _parse_iso_datetime(alerta.get("ts_iso"))
         last_valid_ts = checkpoint
         last_valid_pac = prev_state.get("ultima_leitura_pac")
+        if ultimo_dia_incompleto is not None and (
+            checkpoint is None or checkpoint.date() <= ultimo_dia_incompleto
+        ):
+            rec_seq = seq_zero = 0
 
         for item in lst:
             ts = item["ts"]
-            if item["sem_dados"]:
-                continue
             if last_valid_ts is not None and ts <= last_valid_ts:
                 continue
-            if last_valid_ts and expected_interval and (ts - last_valid_ts) > (expected_interval * 2):
+            if item["sem_dados"]:
+                # Leitura invalida: neutra para a abertura (nao soma nem zera
+                # seq_zero), mas interrompe uma recuperacao em andamento.
+                rec_seq = 0
+                continue
+            if last_valid_ts and (
+                ts.date() != last_valid_ts.date()
+                or (expected_interval and (ts - last_valid_ts) > (expected_interval * 2))
+            ):
                 seq_zero = 0
                 rec_seq = 0
 
+            dentro_janela = janela_inicio <= ts.time() <= janela_fim
             pac_zero = item["pac_zero"]  # True se potência == 0.0
             if pac_zero:
-                seq_zero = seq_zero + 1
+                seq_zero = seq_zero + 1 if dentro_janela else 0
                 rec_seq = 0
             else:
                 seq_zero = 0
@@ -1280,7 +1313,7 @@ def detectar_falhas_inversores(
                 rec_seq = 0
                 ultima_confirmacao_dt = ts
 
-            if ativa and pac_zero:
+            if ativa and pac_zero and dentro_janela:
                 ultima_confirmacao_dt = ts
 
             if ativa and rec_seq >= INVERTER_RECOVERY_CONSECUTIVE_READINGS:
@@ -1468,6 +1501,15 @@ def _montar_alerta_inversor(item: dict, nome: str, cap, janela_label_inv: str) -
     }
 
 
+def _serializar_operacao_monitor(metodo):
+    """Uma varredura so termina depois de aplicar os resultados dos envios."""
+    @wraps(metodo)
+    def executar(self, *args, **kwargs):
+        with self._operation_lock:
+            return metodo(self, *args, **kwargs)
+    return executar
+
+
 # Servico central que orquestra varreduras de reles/inversores e envia notificacoes.
 class MonitorService:
     """Serviço headless: varre relés e inversores e notifica Teams."""
@@ -1503,6 +1545,9 @@ class MonitorService:
         self._state_lock = threading.Lock()
         self._threads = []
         self._scan_lock = threading.Lock()
+        # Ordem: operation -> scan -> state. Reentrante para o heartbeat
+        # executar rele e inversor como uma unica operacao, incluindo os envios.
+        self._operation_lock = threading.RLock()
         self._save_state_fail_count = 0
 
     # Inicia o monitor em modo daemon criando threads de varredura.
@@ -3122,15 +3167,18 @@ class MonitorService:
             self._save_state()
 
     # Busca alertas de rele nas usinas e dispara notificacoes unicas por evento.
+    @_serializar_operacao_monitor
     def executar_varredura_rele(self):
         with self._scan_lock:
             _t0_scan_rele = time.monotonic()
             agora = datetime.now()
-            # começa no último fim de varredura + delta; primeira vez vai até 00:00
+            # Sem cursor individual, nao confundir horario da varredura com
+            # leitura recebida. Preservar backfill legado anterior a hoje.
+            inicio_padrao = datetime.combine(agora.date(), datetime.min.time())
             if self.ultima_varredura_rele:
-                inicio_padrao = self.ultima_varredura_rele + timedelta(seconds=WINDOW_DELTA_SECONDS)
-            else:
-                inicio_padrao = datetime.combine(agora.date(), datetime.min.time())
+                inicio_padrao = min(
+                    inicio_padrao, self.ultima_varredura_rele + timedelta(seconds=WINDOW_DELTA_SECONDS)
+                )
             logger_rele.info("Varredura de rele iniciada.")
             if RELE_DEBUG:
                 logger_rele.info(
@@ -3195,7 +3243,11 @@ class MonitorService:
                         agora=agora,
                     )
 
-                self.ultima_varredura_rele_por_usina[usina_id] = agora
+                if max_ts_rele is not None:
+                    anterior = self.ultima_varredura_rele_por_usina.get(usina_id)
+                    self.ultima_varredura_rele_por_usina[usina_id] = (
+                        max(anterior, max_ts_rele) if anterior else max_ts_rele
+                    )
 
             if usinas_sem_dados:
                 for base in self.rele_alertas_ativos:
@@ -3238,13 +3290,15 @@ class MonitorService:
         logger_rele.info("Varredura de rele concluida.")
 
     # Analisa inversores e alerta se houver falha persistente ou recuperacao.
+    @_serializar_operacao_monitor
     def executar_varredura_inversor(self):
         with self._scan_lock:
             _t0_scan_inv = time.monotonic()
             agora = datetime.now()
-            # Reconsulta recente para revalidar leituras atrasadas e estados legados.
-            # O corte incremental e individual, em detectar_falhas_inversores.
-            inicio_padrao = datetime.combine(agora.date() - timedelta(days=1), datetime.min.time())
+            # Consulta somente o dia corrente (uma chamada por usina). Leituras ja
+            # processadas sao descartadas por inversor (ultima_leitura_ts) em
+            # detectar_falhas_inversores; o dia anterior nao e reconsultado.
+            inicio_padrao = datetime.combine(agora.date(), datetime.min.time())
             logger_inv.info("Varredura de inversor iniciada.")
             pend_norm = self.pending_notifications.setdefault("inv_normalizados", {})
             self._suprimir_inversores_por_rele_ativo(self.usinas_alerta_rele_recente)
@@ -3277,10 +3331,6 @@ class MonitorService:
                 janela_label_inv = _formatar_janela_solar_label(janela_inicio_inv, janela_fim_inv)
 
                 inicio_janela = inicio_padrao
-                last_usina = self.ultima_varredura_inversor_por_usina.get(usina_id)
-                if last_usina:
-                    # Preserva o backfill existente apos paradas prolongadas.
-                    inicio_janela = min(inicio_janela, last_usina + timedelta(seconds=WINDOW_DELTA_SECONDS))
                 falhas, recuperados, tem_dados_inv, falhas_ativas_atual, teve_timeout, max_ts_inv = detectar_falhas_inversores(
                     self.api_inversor,
                     usina_id,
@@ -3461,11 +3511,16 @@ class MonitorService:
             return False
         leitura = _parse_iso_datetime(estado.get("ultima_leitura_ts"))
         pac = estado.get("ultima_leitura_pac")
-        if leitura is None or leitura > referencia or not isinstance(pac, (int, float)):
+        if (leitura is None or leitura > referencia or not isinstance(pac, (int, float))
+                or not math.isfinite(pac)):
             return False
         inicio, fim = _obter_janela_solar_inversor((estado.get("alerta") or {}).get("usina"))
-        if not inicio <= leitura.time() <= fim:
-            return False
+        if not inicio <= leitura.time() <= fim and pac <= 0:
+            # Zero noturno nao confirma nem apaga a falha solar anterior.
+            leitura = _parse_iso_datetime(estado.get("ultima_confirmacao_ts"))
+            if (leitura is None or leitura > referencia
+                    or not inicio <= leitura.time() <= fim):
+                return False
         # O relógio de atualização só avança na janela de geração da usina.
         idade_solar = _calcular_sobreposicao_janela_solar(leitura, referencia, inicio, fim)
         return idade_solar <= 2 * INVERTER_INTERVAL
@@ -3493,6 +3548,7 @@ class MonitorService:
         return datetime.combine(amanha, HEARTBEAT_TIMES[0])
 
     # Envia notificacao de heartbeat/saude em horarios fixos.
+    @_serializar_operacao_monitor
     def _enviar_heartbeat(self, previsto: datetime) -> bool:
         # As varreduras adquirem o próprio lock. Atualizar antes do snapshot,
         # na mesma ordem do loop central, preserva a hierarquia relé/inversor.

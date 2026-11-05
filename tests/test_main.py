@@ -14,6 +14,15 @@ if str(ROOT_DIR) not in sys.path:
 import main
 
 
+def _heartbeat_no_horario(service, referencia, monkeypatch):
+    class Clock(datetime):
+        @classmethod
+        def now(cls):
+            return referencia
+    monkeypatch.setattr(main, "datetime", Clock)
+    service._enviar_heartbeat(referencia)
+
+
 class FakeAPI:
     def __init__(self, plants=None, plants_error=False):
         self._plants = plants if plants is not None else []
@@ -102,7 +111,7 @@ def test_reconciliar_inversor_ausente_mantem_alerta_ativo_sem_encerrar_incidente
     assert service.estado_inversores[chave]["alerta"]["inversor"] == "INV-STUCK"
     assert service.estado_inversores[chave]["notificado"] is True
     assert service.estado_inversores[chave]["ausente_scans"] == main.INVERTER_MISSING_SCAN_TOLERANCE
-    assert service.estado_inversores[chave]["ultima_confirmacao_ts"] is None
+    assert service.estado_inversores[chave]["ultima_confirmacao_ts"] == "2025-01-01T09:45:00"
     assert chave in service.pending_notifications["inv_normalizados"]
     assert chave in service.incidentes_inv_ativos
     assert service.historico_incidentes == []
@@ -134,7 +143,7 @@ def test_varredura_inversor_timeout_parcial_nao_limpa_ativo_existente(state_file
     assert service.estado_inversores[chave]["ausente_scans"] == 0
 
 
-def test_heartbeat_conta_inversor_ativo_mesmo_apos_ausencia(state_file, monkeypatch):
+def test_heartbeat_mantem_inversor_apos_ausencia(state_file, monkeypatch):
     service = main.MonitorService(FakeAPI(), FakeAPI())
     chave = "1:INV-STUCK"
     service.estado_inversores[chave] = {
@@ -159,11 +168,15 @@ def test_heartbeat_conta_inversor_ativo_mesmo_apos_ausencia(state_file, monkeypa
 
     service._enviar_heartbeat(datetime(2025, 1, 1, 12, 0, 0))
 
-    assert "**Alertas de inversor ativos: 1**" in payload["text"]
-    assert "Usina 1 (1)" in payload["text"]
+    assert "**Falhas de inversor confirmadas: 0**" in payload["text"]
+    assert "sem confirmação recente" not in payload["text"]
+    assert "INV-STUCK" in payload["text"]
 
 
-def test_load_state_backfill_confirmacao_inversor_ativo_usa_ultima_varredura(state_file):
+    assert "Falhas anteriores sem dados recentes: 1" in payload["text"]
+    assert service.estado_inversores["1:INV-STUCK"]["ativa"]
+
+def test_load_state_nao_inventa_confirmacao_inversor(state_file):
     state_payload = {
         "schema_version": main.STATE_SCHEMA_VERSION,
         "ultima_varredura_rele": None,
@@ -193,10 +206,10 @@ def test_load_state_backfill_confirmacao_inversor_ativo_usa_ultima_varredura(sta
     service = main.MonitorService(FakeAPI(), FakeAPI())
     service._load_state()
 
-    assert service.estado_inversores["1:INV-ATIVO"]["ultima_confirmacao_ts"] == "2025-01-01T11:45:00"
+    assert service.estado_inversores["1:INV-ATIVO"]["ultima_confirmacao_ts"] is None
 
 
-def test_heartbeat_conta_inversor_ativo_sem_confirmacao_recente(state_file, monkeypatch):
+def test_heartbeat_mantem_inversor_sem_confirmacao_recente(state_file, monkeypatch):
     service = main.MonitorService(FakeAPI(), FakeAPI())
     service.estado_inversores["1:INV-STUCK"] = {
         "ativa": True,
@@ -218,13 +231,18 @@ def test_heartbeat_conta_inversor_ativo_sem_confirmacao_recente(state_file, monk
 
     service._enviar_heartbeat(datetime(2025, 1, 1, 12, 0, 0))
 
-    assert "**Alertas de inversor ativos: 1**" in payload["text"]
-    assert "Usina 1 (1)" in payload["text"]
+    assert "**Falhas de inversor confirmadas: 0**" in payload["text"]
+    assert "sem confirmação recente" not in payload["text"]
+    assert "INV-STUCK" in payload["text"]
 
+
+    assert "Falhas anteriores sem dados recentes: 1" in payload["text"]
+    assert service.estado_inversores["1:INV-STUCK"]["ativa"]
 
 def test_heartbeat_mantem_inversor_com_confirmacao_recente(state_file, monkeypatch):
     service = main.MonitorService(FakeAPI(), FakeAPI())
-    recente = datetime.now() - timedelta(minutes=5)
+    referencia = datetime(2025, 1, 1, 12)
+    recente = referencia - timedelta(minutes=5)
     service.estado_inversores["1:INV-ATIVO"] = {
         "ativa": True,
         "rec_seq": 0,
@@ -233,6 +251,8 @@ def test_heartbeat_mantem_inversor_com_confirmacao_recente(state_file, monkeypat
         "notificado": True,
         "ausente_scans": 0,
         "ultima_confirmacao_ts": recente.isoformat(),
+        "ultima_leitura_ts": recente.isoformat(),
+        "ultima_leitura_pac": 0,
     }
 
     payload = {}
@@ -243,10 +263,12 @@ def test_heartbeat_mantem_inversor_com_confirmacao_recente(state_file, monkeypat
 
     monkeypatch.setattr(main, "_teams_post_card", fake_post_card)
 
-    service._enviar_heartbeat(datetime(2025, 1, 1, 12, 0, 0))
+    _heartbeat_no_horario(service, referencia, monkeypatch)
 
-    assert "**Alertas de inversor ativos: 1**" in payload["text"]
+    assert "**Falhas de inversor confirmadas: 1**" in payload["text"]
     assert "Usina 1 (1)" in payload["text"]
+    assert "Série: INV-ATIVO" in payload["text"]
+
 
 
 def test_get_plants_error_nao_avanca_varredura(state_file):
@@ -1451,7 +1473,7 @@ def test_varredura_inversor_envia_teams_fora_do_lock(state_file, monkeypatch):
 
 def test_backfill_nao_restaura_inversor_suprimido(state_file):
     """Inversor suprimido por ausência (ausente_scans >= TOLERANCE, ultima_confirmacao_ts=None)
-    não deve ter ultima_confirmacao_ts restaurado pelo backfill de _load_state."""
+    não deve aguardar uma leitura real para confirmar a falha."""
     chave = "1:INV-A"
     varredura_ts = datetime(2025, 1, 6, 10, 0, 0)
     state = {
@@ -1489,9 +1511,9 @@ def test_backfill_nao_restaura_inversor_suprimido(state_file):
     )
 
 
-def test_backfill_restaura_inversor_legado(state_file):
+def test_estado_legado_aguarda_confirmacao_real(state_file):
     """Inversor ativo com ausente_scans=0 e ultima_confirmacao_ts=None (estado legado)
-    deve ter ultima_confirmacao_ts restaurado pelo backfill de _load_state."""
+    deve aguardar uma leitura real para confirmar a falha."""
     chave = "1:INV-A"
     varredura_ts = datetime(2025, 1, 6, 10, 0, 0)
     # JSON legado: sem ausente_scans e sem ultima_confirmacao_ts no payload
@@ -1523,9 +1545,7 @@ def test_backfill_restaura_inversor_legado(state_file):
     service = main.MonitorService(api, api)
     service._load_state()
 
-    assert service.estado_inversores[chave]["ultima_confirmacao_ts"] is not None, (
-        "Regressao P1: backfill nao restaurou ultima_confirmacao_ts em state legado valido"
-    )
+    assert service.estado_inversores[chave]["ultima_confirmacao_ts"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -2037,6 +2057,8 @@ def test_inversor_suprimido_volta_ao_heartbeat_apos_nova_confirmacao(state_file,
                          {chave: {"ativa": True, "rec_seq": 0,
                                   "seq_zero": main.INVERTER_CONSECUTIVE_READINGS,
                                   "ultima_confirmacao_ts": nova_confirmacao_ts.isoformat(),
+                                  "ultima_leitura_ts": nova_confirmacao_ts.isoformat(),
+                                  "ultima_leitura_pac": 0,
                                   "tem_dado_valido": True}},
                          False, nova_confirmacao_ts),
     )
@@ -2056,9 +2078,9 @@ def test_inversor_suprimido_volta_ao_heartbeat_apos_nova_confirmacao(state_file,
 
     monkeypatch.setattr(main, "_teams_post_card", fake_hb_card)
     referencia = nova_confirmacao_ts + timedelta(minutes=5)
-    service._enviar_heartbeat(referencia)
+    _heartbeat_no_horario(service, referencia, monkeypatch)
 
-    assert "**Alertas de inversor ativos: 1**" in hb_payload["text"]
+    assert "**Falhas de inversor confirmadas: 1**" in hb_payload["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -2286,12 +2308,12 @@ def test_merge_preserva_ausente_scans_quando_pac_invalido(state_file, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# P2-merge-2 — merge não restaura ultima_confirmacao_ts zerada pela reconciliação
+# P2-merge-2 — ausencia preserva a ultima confirmacao conhecida
 # ---------------------------------------------------------------------------
 
-def test_merge_nao_restaura_confirmacao_ts_apos_supressao(state_file, monkeypatch):
+def test_merge_preserva_confirmacao_ts_apos_ausencia(state_file, monkeypatch):
     """Ao atingir INVERTER_MISSING_SCAN_TOLERANCE, _reconciliar_inversores_ausentes
-    zera ultima_confirmacao_ts. O merge não deve restaurá-la a partir de falhas_ativas_atual."""
+    preserva ultima_confirmacao_ts para diagnostico, sem confirmar recuperacao."""
     api = FakeAPI(plants=[{"id": 1, "nome": "Usina 1", "capacidade": 100}])
     service = main.MonitorService(api, api)
     chave = "1:INV-A"
@@ -2328,7 +2350,7 @@ def test_merge_nao_restaura_confirmacao_ts_apos_supressao(state_file, monkeypatc
         service.executar_varredura_inversor()
 
     assert service.estado_inversores[chave]["ausente_scans"] == main.INVERTER_MISSING_SCAN_TOLERANCE
-    assert service.estado_inversores[chave]["ultima_confirmacao_ts"] is None
+    assert service.estado_inversores[chave]["ultima_confirmacao_ts"] == "2025-01-06T08:00:00"
 
 
 @pytest.mark.parametrize("valor,esperado", [
@@ -2696,7 +2718,7 @@ def test_formatar_texto_heartbeat_status_ok():
         rele_usinas=[], inv_usina_counts={},
         previsto=datetime.now(),
     )
-    assert "Status: OK" in texto
+    assert "Varreduras: em dia" in texto
     assert "SCAN ATRASADO" not in texto
 
 
@@ -3164,3 +3186,50 @@ def test_post_day_json_invalido_seta_reason_json_invalid(monkeypatch):
     assert timeout_flag is False
     assert api.last_post_day_error is True
     assert api.last_post_day_error_reason == "JSON_INVALID"
+
+
+def test_serial_api_preservado_no_estado_e_heartbeat(state_file, monkeypatch):
+    inicio = datetime(2025, 1, 6, 9)
+    registros = _leituras_inv(inicio, [0] * main.INVERTER_CONSECUTIVE_READINGS, inv_id="42")
+    for registro in registros:
+        registro["conteudojson"]["esn"] = "SN-00042"
+    falhas, _, _, estados, _, _ = main.detectar_falhas_inversores(
+        FakeDayInverterAPI(registros), "1", inicio, inicio + timedelta(hours=2), {})
+    estado = main._compor_entrada_estado_inversor(
+        {"alerta": main._montar_alerta_inversor(falhas[0], "Usina 1", None, "06:30-17:00")},
+        estados["1:42"], True)
+    assert estado["serial"] == "SN-00042"
+    service = main.MonitorService(FakeAPI())
+    service.estado_inversores["1:42"] = estado
+    service._save_state()
+    service = main.MonitorService(FakeAPI())
+    service._load_state()
+    assert service.estado_inversores["1:42"]["serial"] == "SN-00042"
+    payload = {}
+    monkeypatch.setattr(main, "_teams_post_card", lambda **kw: payload.update(kw))
+    referencia = datetime.fromisoformat(estado["ultima_confirmacao_ts"])
+    _heartbeat_no_horario(service, referencia, monkeypatch)
+    assert "S\u00e9rie: SN-00042" in payload["text"]
+
+
+@pytest.mark.parametrize("minutos, esperado", [(0, True), (30, True), (31, False), (-1, False)])
+def test_heartbeat_validade_confirmacao(minutos, esperado):
+    referencia = datetime(2025, 1, 6, 12)
+    estado = {"ativa": True, "ultima_leitura_pac": 0, "ultima_leitura_ts": (referencia - timedelta(minutes=minutos)).isoformat()}
+    assert main.MonitorService._inversor_conta_no_heartbeat(estado, referencia) is esperado
+
+
+def test_recuperacao_confirmada_remove_inversor_do_heartbeat(state_file, monkeypatch):
+    inicio = datetime(2025, 1, 6, 9)
+    anterior = {"ativa": True, "alerta": {"usina": "Usina 1", "inversor": "INV-1"}}
+    registros = _leituras_inv(inicio, [100] * main.INVERTER_RECOVERY_CONSECUTIVE_READINGS)
+    _, recuperados, _, estados, _, _ = main.detectar_falhas_inversores(
+        FakeDayInverterAPI(registros), "1", inicio, inicio + timedelta(hours=2), {"1:INV-1": anterior})
+    assert len(recuperados) == 1
+    service = main.MonitorService(FakeAPI())
+    service.estado_inversores["1:INV-1"] = main._compor_entrada_estado_inversor(anterior, estados["1:INV-1"], True)
+    payload = {}
+    monkeypatch.setattr(main, "_teams_post_card", lambda **kw: payload.update(kw))
+    service._enviar_heartbeat(inicio + timedelta(hours=2))
+    assert "**Falhas de inversor confirmadas: 0**" in payload["text"]
+    assert "INV-1" not in payload["text"]

@@ -382,9 +382,7 @@ Depois disso, usa checkpoint por usina:
 ultima_varredura_rele_por_usina[usina_id] + 1 segundo
 ```
 
-O checkpoint por usina avança com o horário da varredura (`agora`) quando a usina retorna dados válidos e não houve timeout parcial.
-
-Essa regra segue a versão operacional que funcionava: a próxima consulta começa depois da varredura concluída, não depois do timestamp do último registro retornado pela API.
+O checkpoint por usina avança para o maior `tsleitura` processado (`max_ts_rele`), nunca para trás, e somente quando a usina retornou leituras válidas sem timeout. Assim, uma leitura publicada com atraso, mas posterior à última já processada, é encontrada na varredura seguinte. Sem checkpoint, a consulta começa às 00:00 do dia corrente. Limite conhecido: leituras publicadas fora de ordem, com horário anterior à última leitura já processada do mesmo relé, não são reprocessadas.
 
 ### Como os dados são lidos
 
@@ -608,7 +606,7 @@ Essa regra reproduz o comportamento operacional esperado da versão que funciona
 
 ### Janelas solares
 
-Inversores só são avaliados dentro da janela solar.
+A abertura de falha de inversor só considera leituras dentro da janela solar. Leituras fora da janela não abrem falha e zeros noturnos não contam; PAC positivo fora da janela (por exemplo, depois das 17:00) conta para a recuperação de uma falha já ativa.
 
 | Caso | Início | Fim |
 |---|---:|---:|
@@ -621,13 +619,7 @@ Relés usam a janela `SOLAR_WINDOW_START = 06:00` e `SOLAR_WINDOW_END = 17:30` p
 
 ### Janela de busca
 
-Assim como no relé, a primeira varredura sem checkpoint começa em `00:00` do dia atual. Depois disso, cada usina usa:
-
-```python
-ultima_varredura_inversor_por_usina[usina_id] + 1 segundo
-```
-
-O checkpoint avança com `max_ts_inv`, o maior `tsleitura` válido com PAC parseável dentro da janela.
+Cada varredura consulta somente o dia corrente (de 00:00 até o horário da varredura), com uma chamada `day_inverter` por usina. Leituras já processadas são descartadas por inversor, usando `ultima_leitura_ts` do estado, então reconsultar o dia não duplica contagens. O dia anterior não é reconsultado, nem depois de uma parada do monitor: eventos que começaram e terminaram durante a parada não geram alerta, e o histórico fica a cargo do relatório semanal, que faz coleta própria pela API. O checkpoint `ultima_varredura_inversor_por_usina` continua sendo gravado (maior `tsleitura` válido), mas não define mais a janela de consulta.
 
 ### Identificação do inversor
 
@@ -661,10 +653,10 @@ O valor é normalizado por `extrair_valor_numerico()`, que aceita:
 Regra:
 
 ```python
-INVERTER_CONSECUTIVE_READINGS = 3
+INVERTER_CONSECUTIVE_READINGS = 6
 ```
 
-Uma falha é confirmada quando o inversor tem 3 leituras válidas consecutivas com:
+Uma falha é confirmada quando o inversor tem 6 leituras válidas consecutivas, dentro da janela solar, com:
 
 ```python
 PAC <= 0
@@ -674,11 +666,10 @@ Isso inclui PAC negativo. PAC negativo não conta como recuperação.
 
 PAC ausente ou não parseável:
 
-- entra como leitura `sem_dados`;
-- não incrementa `seq_zero`;
-- não incrementa `rec_seq`;
-- não confirma falha;
-- não confirma recuperação.
+- entra como leitura `sem_dados` (inclui valores não finitos, como NaN e infinito);
+- não altera `seq_zero`: não soma nem zera a contagem de abertura;
+- zera `rec_seq`: interrompe uma recuperação em andamento;
+- não confirma falha nem recuperação.
 
 ### Recuperação de inversor
 
@@ -715,6 +706,8 @@ Isso permite que a confirmação de falha ou recuperação continue entre scans 
 Para cada inversor, o código calcula o intervalo mediano entre leituras válidas. Se houver gap maior que duas vezes esse intervalo esperado, os contadores `seq_zero` e `rec_seq` são resetados.
 
 Objetivo: evitar que leituras muito distantes sejam tratadas como sequência contínua.
+
+As contagens `seq_zero` e `rec_seq` também são zeradas na virada do dia, de modo que uma sequência nunca une leituras de datas diferentes.
 
 ### Sem dados de inversor
 
@@ -908,13 +901,7 @@ agora - ultima_varredura_inversor > 2 * INVERTER_INTERVAL
 
 ### Inversor no heartbeat
 
-Um inversor entra no heartbeat se:
-
-- `ativa=True`.
-
-`ultima_confirmacao_ts` continua existindo no estado para diagnóstico e reconciliação, mas não remove uma falha ativa do heartbeat.
-
-Motivo operacional: se o inversor ainda está ativo no estado, o operador precisa ver que a falha persiste, inclusive fora da janela solar ou sem confirmação recente. A falha só deixa o heartbeat quando há recuperação real, supressão por hierarquia de relé ou limpeza explícita do estado ativo.
+Todo inversor com `ativa=True` aparece no heartbeat, em um de dois grupos. Conta em **"Falhas de inversor confirmadas"** quando a última leitura válida tem no máximo 30 minutos de janela solar (`2 * INVERTER_INTERVAL`); se essa leitura for um zero fora da janela, vale a última confirmação dentro da janela. Os demais ativos aparecem em **"Falhas anteriores sem dados recentes"**, fora da contagem. A falha só deixa o heartbeat com recuperação confirmada, ou por supressão pela hierarquia de relé.
 
 ---
 
@@ -1125,6 +1112,10 @@ Serializa:
 
 Chamadas de API de scan hoje ocorrem dentro do `_scan_lock`. Envio para Teams acontece fora do lock principal nos scans, o que reduz bloqueio enquanto o webhook responde.
 
+### `_operation_lock`
+
+Lock reentrante (`RLock`) que serializa operações completas: `executar_varredura_rele()`, `executar_varredura_inversor()` e `_enviar_heartbeat()`, incluindo os envios ao Teams e a aplicação dos resultados. Impede que o heartbeat e o loop de varreduras enviem a mesma notificação em duplicidade. Ordem de aquisição: `_operation_lock` → `_scan_lock` → `_state_lock`. O relatório semanal não usa este lock.
+
 ### `_state_lock`
 
 Protege escrita atômica do arquivo de state.
@@ -1203,13 +1194,13 @@ python -m pytest -q
 Coleta atual:
 
 ```txt
-134 tests collected
+253 tests collected
 ```
 
 Na última execução local nesta estação:
 
 ```txt
-134 passed in 2.10s
+253 passed in 0.93s
 ```
 
 Arquivos:
@@ -1226,7 +1217,7 @@ Arquivos:
 - validação de configuração sem expor segredos;
 - `.env.example` sem segredos reais;
 - janela solar padrão e Ibimirim;
-- falha de inversor por 3 leituras PAC zero/negativo;
+- falha de inversor por 6 leituras PAC zero/negativo na janela solar;
 - recuperação por 2 leituras PAC positivo;
 - PAC ausente/inválido;
 - resposta vazia dentro e fora da janela solar;
@@ -1326,14 +1317,14 @@ python -m pytest -q
 | Inversor | Scan a cada 15 minutos. |
 | Heartbeat | 07:00, 12:00, 17:00, 20:00, 23:00. |
 | Relatório semanal | Segunda-feira após 00:05, referente à semana anterior. |
-| Falha de inversor | 3 leituras consecutivas com `PAC <= 0`. |
+| Falha de inversor | 6 leituras consecutivas com `PAC <= 0` na janela solar. |
 | Recuperação de inversor | 2 leituras consecutivas com `PAC > 0`. |
 | Supressão de inversor ausente | 3 scans válidos sem observação. |
-| Critério de inversor no heartbeat | `ativa=True`. |
+| Critério de inversor no heartbeat | `ativa=True`; confirmada se a leitura tiver até 30 min de janela solar. |
 | Retry Teams | 3 tentativas. |
 | Timeout `post_day` | 30 segundos por tentativa. |
 | State | `state/monitor_state.json`. |
 | Lock | `state/.monitor_lock`. |
 | Logs de relé | `logs/rele/rele.log`. |
 | Logs de inversor | `logs/inversor/inversor.log`. |
-| Testes | 142 casos coletados pelo pytest. |
+| Testes | 253 casos coletados pelo pytest. |
