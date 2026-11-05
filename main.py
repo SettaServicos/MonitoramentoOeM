@@ -150,6 +150,20 @@ INVERTER_RECOVERY_CONSECUTIVE_READINGS = 2
 INVERTER_FAILURE_LABEL = f"PAC=0 ({INVERTER_CONSECUTIVE_READINGS} leituras consecutivas)"
 INVERTER_MISSING_SCAN_TOLERANCE = 3
 
+# Passo 4a: falha aberta de inversor substituido/retirado no cadastro (plant_devices).
+# SUBSTITUICAO_VERIFICAR=False desliga a verificacao inteira (comportamento anterior).
+# SUBSTITUICAO_ENCERRAR=False e o modo observacao: so registra no log o que encerraria.
+SUBSTITUICAO_VERIFICAR = True
+SUBSTITUICAO_ENCERRAR = False
+SUBSTITUICAO_SEM_LEITURA_MINIMA = timedelta(hours=24)
+SUBSTITUICAO_MAX_ENCERRAMENTOS_DIA = 3
+SUBSTITUICAO_MAX_USINAS_POR_VARREDURA = 5
+SUBSTITUICAO_RETRY_FALHA = timedelta(hours=1)
+SUBSTITUICAO_STATUS_ATIVOS = (1, 2)       # 1 Ativo, 2 Manutencao
+SUBSTITUICAO_STATUS_RETIRADOS = (3, 4)    # 3 Cancelado, 4 Bloqueado
+# Resumo no Teams: so no heartbeat deste horario (o primeiro do dia).
+SUBSTITUICAO_HEARTBEAT_HORARIO = dtime(7, 0)
+
 # SSL: ajuste para o bundle correto no servidor (ex.: /etc/ssl/certs/ca.pem)
 VERIFY_CA = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or True
 
@@ -563,6 +577,38 @@ class PVOperationAPI:
         self.last_get_plants_error = True
         return None
 
+    def get_plant_devices(self, plant_id) -> list | None:
+        """Cadastro de equipamentos da usina. None = sem informacao confiavel."""
+        contexto = f"plant_devices (usina {plant_id})"
+        r, _timeout_flag = self._request_with_retry(
+            "post",
+            f"{self.base_url}/plant_devices",
+            json_payload={"id": int(plant_id)},
+            timeout=20,
+            max_tentativas=2,
+            backoff_base=2,
+            contexto=contexto,
+            reauth_on_401=True,
+            retry_on_status=lambda status: status == 408 or status == 429 or 500 <= status <= 599,
+            log_status=True,
+            conn_error_suffix="Tentando recriar sessão.",
+        )
+        if r is None or r.status_code != 200:
+            return None
+        try:
+            dados = r.json()
+        except Exception:
+            logger.error(f"Resposta não-JSON em {contexto} (status 200).")
+            return None
+        if isinstance(dados, list) and dados and isinstance(dados[0], dict):
+            dados = dados[0]
+        if not isinstance(dados, dict):
+            return None
+        devices = dados.get("plant_devices")
+        if not isinstance(devices, list):
+            return None
+        return [d for d in devices if isinstance(d, dict)]
+
     # Faz chamada para endpoint diario (day_*) com retry e backoff exponencial leve.
     def post_day(self, endpoint: str, plant_id: int, date: datetime) -> tuple[list | None, bool]:
         """Chama endpoints day_* com retry/backoff. Retorna (dados ou None, timeout_flag)."""
@@ -846,6 +892,7 @@ def _formatar_texto_heartbeat(
     previsto: datetime,
     inv_detalhes: dict | None = None,
     inv_sem_dados: dict | None = None,
+    cadastro_linhas: list | None = None,
 ) -> str:
     bullet_prefix = "    • "
     info = [
@@ -876,6 +923,18 @@ def _formatar_texto_heartbeat(
         for nome, detalhes in sorted(inv_sem_dados.items()):
             info.append(f"{bullet_prefix}{nome} ({len(detalhes)})")
             info.extend(f"{bullet_prefix}{detalhe}" for detalhe in sorted(detalhes))
+    if cadastro_linhas:
+        titulos = {
+            "OBSERVACAO": "Cadastro indica substituição (observação, nada foi encerrado)",
+            "ENCERRADA": "Encerradas por substituição no cadastro (últimas 24 h)",
+            "SEM_SUBSTITUTO": "Retirados no cadastro sem substituto (falha mantida)",
+        }
+        for tipo in ("OBSERVACAO", "ENCERRADA", "SEM_SUBSTITUTO"):
+            itens = [texto for t, texto in cadastro_linhas if t == tipo]
+            if itens:
+                info.append("")
+                info.append(f"**{titulos[tipo]}: {len(itens)}**")
+                info.extend(f"{bullet_prefix}{texto}" for texto in itens)
     return "  \n".join(info)
 
 
@@ -1391,6 +1450,68 @@ def _mensagem_sem_dados_inversor(usina_nome, inversor_serial: str | None, motivo
     return f'Sem dados de inversor em "{usina_txt}" - Inversor: {inversor_txt} (motivo: {motivo}).'
 
 
+def _esn_base_cadastro(esn) -> str:
+    """device_esn sem o sufixo "@epoch" que a PV Operation adiciona ao bloquear."""
+    return str(esn or "").split("@", 1)[0].strip()
+
+
+def _data_bloqueio_cadastro(esn) -> datetime | None:
+    txt = str(esn or "")
+    if "@" not in txt:
+        return None
+    try:
+        epoch = int(txt.split("@", 1)[1].strip())
+        return datetime.fromtimestamp(epoch)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _device_retirado(device: dict) -> bool:
+    return (device.get("device_status") in SUBSTITUICAO_STATUS_RETIRADOS
+            or "@" in str(device.get("device_esn") or ""))
+
+
+def _classificar_substituicao(seriais: set, devices) -> tuple[str, dict | None]:
+    """Decide se uma falha aberta pode ser encerrada pelo cadastro.
+
+    Retorna (codigo, device). So "RETIRADO" permite encerrar; qualquer duvida
+    mantem a falha aberta.
+    """
+    if not isinstance(devices, list) or not devices:
+        return "CADASTRO_INDISPONIVEL", None
+    if not any(d.get("device_status") == 1 and not _device_retirado(d) for d in devices):
+        # Nenhum equipamento ativo na usina: resposta suspeita.
+        return "CADASTRO_SUSPEITO", None
+    seriais = {str(x).strip() for x in seriais if x and str(x).strip()}
+    if not seriais:
+        return "SEM_SERIAL", None
+    encontrados = [d for d in devices if _esn_base_cadastro(d.get("device_esn")) in seriais]
+    if not encontrados:
+        return "NAO_ENCONTRADO", None
+    for d in encontrados:
+        if not _device_retirado(d):
+            return ("ATIVO" if d.get("device_status") in SUBSTITUICAO_STATUS_ATIVOS else "STATUS_DESCONHECIDO"), d
+    retirado = max(encontrados, key=lambda d: _data_bloqueio_cadastro(d.get("device_esn")) or datetime.min)
+    # Substituicao exige um substituto: equipamento ATIVO na mesma posicao
+    # (mesmo device_name) com outro serial. Bloqueado sem substituto (ex.: enviado
+    # para reparo) mantem a falha aberta.
+    if _substituto_cadastro(retirado, seriais, devices) is None:
+        return "RETIRADO_SEM_SUBSTITUTO", retirado
+    return "RETIRADO", retirado
+
+
+def _substituto_cadastro(retirado: dict, seriais: set, devices) -> dict | None:
+    nome = str(retirado.get("device_name") or "").strip()
+    if not nome or nome in seriais:
+        return None
+    for d in devices:
+        if (str(d.get("device_name") or "").strip() == nome
+                and d.get("device_status") == 1 and not _device_retirado(d)
+                and _esn_base_cadastro(d.get("device_esn")) not in seriais):
+            return d
+    return None
+
+
 def _normalizar_campo_chave_rele(valor) -> str:
     return re.sub(r"\s+", " ", str(valor or "").strip()).lower()
 
@@ -1578,6 +1699,9 @@ class MonitorService:
         self._relatorio_gerado = None     # (report_id, arquivo, semana_txt, cobertura) ja escrito
         self._relatorio_falha_notificada = set()  # (report_id, tipo) de falhas ja avisadas no Teams
         self._coleta_nomes = {}           # usina_id -> nome, da coleta semanal em andamento
+        self._substituicao_proxima = {}   # usina_id -> proxima verificacao de cadastro (memoria)
+        self._substituicao_encerramentos = {}  # data -> encerramentos no dia (memoria)
+        self._substituicao_resumo = {}    # chave -> (tipo, texto, ts) para o heartbeat das 07:00
         self._init_state_defaults()
         self.stop_event = threading.Event()
         self._lock_fd = None
@@ -2103,6 +2227,8 @@ class MonitorService:
                             "equipamento": str(item.get("equipamento", "")),
                             "inicio_ts": str(item.get("inicio_ts")),
                             "fim_ts": str(item.get("fim_ts")) if item.get("fim_ts") else None,
+                            # Motivo de encerramento especial (ex.: SUBSTITUICAO_CADASTRO).
+                            **({"encerramento": str(item["encerramento"])} if item.get("encerramento") else {}),
                         }
                     )
 
@@ -3434,6 +3560,143 @@ class MonitorService:
         logger_rele.info("[SCAN] Varredura rele fase lock/API concluida em %.1fs", lock_api_duration)
         logger_rele.info("Varredura de rele concluida.")
 
+    def _candidatos_substituicao(self, agora: datetime) -> dict:
+        """usina_id -> [(chave, seriais, referencia)] de falhas abertas sem leitura recente."""
+        limite = agora - SUBSTITUICAO_SEM_LEITURA_MINIMA
+        candidatos = {}
+        for chave, estado in self.estado_inversores.items():
+            if not isinstance(estado, dict) or not estado.get("ativa") or ":" not in str(chave):
+                continue
+            usina_id, sufixo = str(chave).split(":", 1)
+            if usina_id in self.usinas_alerta_rele_recente:
+                continue
+            alerta = estado.get("alerta") if isinstance(estado.get("alerta"), dict) else {}
+            incidente = self.incidentes_inv_ativos.get(chave) or {}
+            referencia = (_parse_iso_datetime(estado.get("ultima_leitura_ts"))
+                          or _parse_iso_datetime(alerta.get("ts_iso"))
+                          or _parse_iso_datetime(incidente.get("inicio_ts")))
+            if referencia is None or referencia > limite:
+                continue
+            seriais = {estado.get("serial"), sufixo, alerta.get("inversor"), incidente.get("equipamento")}
+            candidatos.setdefault(usina_id, []).append((chave, seriais, referencia))
+        return candidatos
+
+    def _verificar_substituicoes_inversor(self, agora: datetime) -> None:
+        """Encerra (ou, em observacao, so registra) falhas de inversor retirado do cadastro.
+
+        Sem envio ao Teams (decisao D1). Qualquer duvida mantem a falha aberta.
+        """
+        if not SUBSTITUICAO_VERIFICAR:
+            return
+        consultar = getattr(self.api_inversor, "get_plant_devices", None)
+        if not callable(consultar):
+            return
+        candidatos = self._candidatos_substituicao(agora)
+        usinas_consultadas = 0
+        for usina_id in sorted(candidatos):
+            proxima = self._substituicao_proxima.get(usina_id)
+            if proxima is not None and agora < proxima:
+                continue
+            if usinas_consultadas >= SUBSTITUICAO_MAX_USINAS_POR_VARREDURA:
+                break
+            usinas_consultadas += 1
+            try:
+                devices = consultar(usina_id)
+            except Exception:
+                logger_inv.exception(f"[SUBSTITUICAO] Erro ao consultar cadastro da usina {usina_id}.")
+                devices = None
+            if devices is None:
+                self._substituicao_proxima[usina_id] = agora + SUBSTITUICAO_RETRY_FALHA
+                logger_inv.warning(f"[SUBSTITUICAO] Cadastro indisponível para usina {usina_id}; falhas mantidas.")
+                continue
+            self._substituicao_proxima[usina_id] = datetime.combine(
+                agora.date() + timedelta(days=1), datetime.min.time())
+            for chave, seriais, referencia in candidatos[usina_id]:
+                estado = self.estado_inversores.get(chave)
+                if not isinstance(estado, dict) or not estado.get("ativa"):
+                    continue
+                alerta = estado.get("alerta") if isinstance(estado.get("alerta"), dict) else {}
+                usina_nome = alerta.get("usina") or f"Usina {usina_id}"
+                serial = estado.get("serial") or chave.split(":", 1)[1]
+                codigo, device = _classificar_substituicao(seriais, devices)
+                if codigo == "RETIRADO_SEM_SUBSTITUTO":
+                    bloqueio = _data_bloqueio_cadastro(device.get("device_esn"))
+                    texto = (f"{usina_nome} — Série {serial} — retirado no cadastro"
+                             f"{' em ' + bloqueio.strftime('%d/%m/%Y') if bloqueio else ''}, sem substituto"
+                             f" na posição \"{str(device.get('device_name') or '').strip() or 'sem nome'}\" — falha mantida aberta")
+                    self._substituicao_resumo[chave] = ("SEM_SUBSTITUTO", texto, agora)
+                    logger_inv.warning(f"[SUBSTITUICAO] {texto}.")
+                    continue
+                if codigo != "RETIRADO":
+                    self._substituicao_resumo.pop(chave, None)
+                    if codigo not in ("ATIVO",):
+                        logger_inv.info(
+                            f"[SUBSTITUICAO] {usina_nome} - Série {serial}: {codigo}; falha mantida.")
+                    continue
+                substituto = _substituto_cadastro(device, seriais, devices) or {}
+                novo_serial = _esn_base_cadastro(substituto.get("device_esn")) or "?"
+                bloqueio = _data_bloqueio_cadastro(device.get("device_esn"))
+                incidente = self.incidentes_inv_ativos.get(chave)
+                inicio = _parse_iso_datetime((incidente or {}).get("inicio_ts"))
+                if bloqueio is not None and bloqueio <= agora and (inicio is None or bloqueio >= inicio):
+                    fim_ts = bloqueio
+                else:
+                    fim_ts = referencia
+                descricao = (
+                    f"{usina_nome} - Série {serial}: cadastro status {device.get('device_status')}"
+                    f" (bloqueio: {bloqueio.strftime('%d/%m/%Y %H:%M') if bloqueio else 'sem data'});"
+                    f" substituto {novo_serial}; fim registrado {fim_ts.strftime('%d/%m/%Y %H:%M')}"
+                )
+                resumo = (f"{usina_nome} — Série {serial} → {novo_serial}"
+                          f" (bloqueio {bloqueio.strftime('%d/%m/%Y') if bloqueio else 'sem data'})")
+                if not SUBSTITUICAO_ENCERRAR:
+                    self._substituicao_resumo[chave] = ("OBSERVACAO", resumo + " — seria encerrada", agora)
+                    logger_inv.warning(f"[SUBSTITUICAO][OBSERVACAO] Encerraria falha de {descricao}.")
+                    continue
+                dia = agora.date()
+                feitos = self._substituicao_encerramentos.get(dia, 0)
+                if feitos >= SUBSTITUICAO_MAX_ENCERRAMENTOS_DIA:
+                    logger_inv.warning(
+                        f"[SUBSTITUICAO] Limite diário de {SUBSTITUICAO_MAX_ENCERRAMENTOS_DIA} encerramentos atingido;"
+                        f" mantida para o próximo dia: {descricao}.")
+                    self._substituicao_proxima[usina_id] = datetime.combine(
+                        agora.date() + timedelta(days=1), datetime.min.time())
+                    continue
+                self._substituicao_encerramentos = {dia: feitos + 1}
+                incidente = self.incidentes_inv_ativos.pop(chave, None)
+                if incidente is not None:
+                    incidente = dict(incidente)
+                    incidente["encerramento"] = "SUBSTITUICAO_CADASTRO"
+                    self._fechar_incidente(incidente, fim_ts)
+                self.pending_notifications.setdefault("inv_normalizados", {}).pop(chave, None)
+                estado.update({
+                    "ativa": False,
+                    "rec_seq": 0,
+                    "seq_zero": 0,
+                    "alerta": None,
+                    "notificado": False,
+                    "ausente_scans": 0,
+                    "ultima_confirmacao_ts": None,
+                })
+                self.estado_inversores[chave] = estado
+                self._substituicao_resumo[chave] = ("ENCERRADA", resumo + " — encerrada", agora)
+                logger_inv.warning(f"[SUBSTITUICAO] Falha encerrada: {descricao}.")
+
+    def _linhas_heartbeat_substituicao(self, referencia: datetime) -> list:
+        """Linhas do heartbeat das 07:00. Itens de ate 26 h; pendentes so se a falha segue aberta."""
+        limite = referencia - timedelta(hours=26)
+        linhas = []
+        for chave, (tipo, texto, ts) in list(self._substituicao_resumo.items()):
+            if ts < limite:
+                self._substituicao_resumo.pop(chave, None)
+                continue
+            estado = self.estado_inversores.get(chave)
+            if tipo != "ENCERRADA" and not (isinstance(estado, dict) and estado.get("ativa")):
+                self._substituicao_resumo.pop(chave, None)
+                continue
+            linhas.append((tipo, texto))
+        return sorted(linhas)
+
     # Analisa inversores e alerta se houver falha persistente ou recuperacao.
     @_serializar_operacao_monitor
     def executar_varredura_inversor(self):
@@ -3610,6 +3873,10 @@ class MonitorService:
 
             if not sem_plantas:
                 self.ultima_varredura_inversor = agora
+            try:
+                self._verificar_substituicoes_inversor(agora)
+            except Exception:
+                logger_inv.exception("[SUBSTITUICAO] Verificação de cadastro interrompida por erro; varredura segue.")
             self._save_state()
             lock_api_duration = time.monotonic() - _t0_scan_inv
         # Lock released — send Teams outside the lock
@@ -3723,6 +3990,12 @@ class MonitorService:
             )
             ultima_rele = self.ultima_varredura_rele
             ultima_inv = self.ultima_varredura_inversor
+            cadastro_linhas = []
+            if previsto.time() == SUBSTITUICAO_HEARTBEAT_HORARIO:
+                try:
+                    cadastro_linhas = self._linhas_heartbeat_substituicao(referencia_hb)
+                except Exception:
+                    logger.exception("[HEARTBEAT] Falha ao montar resumo de substituições; omitido.")
         logger.info("[HEARTBEAT] Aguardou %.2fs pelo scan_lock", lock_wait)
 
         agora_hb = datetime.now()
@@ -3789,6 +4062,7 @@ class MonitorService:
             inv_detalhes=inv_detalhes,
             inv_sem_dados=inv_sem_dados,
             previsto=previsto,
+            cadastro_linhas=cadastro_linhas,
         )
         if erros_atualizacao:
             texto += "  \n⚠️ Falha na atualização: " + ", ".join(erros_atualizacao) + ". Exibindo estados conhecidos."

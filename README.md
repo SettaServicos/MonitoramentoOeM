@@ -1284,6 +1284,20 @@ O próximo scan é calculado depois que a varredura termina. Se uma varredura de
 
 O código atual não mantém credenciais hardcoded sensíveis. Se o processo iniciar sem `.env`/variáveis reais, ele deve falhar rápido.
 
+### 9. Falha de inversor substituído no cadastro (passo 4a)
+
+Ao fim de cada varredura de inversor, `_verificar_substituicoes_inversor` consulta `plant_devices` somente para usinas que têm falha de inversor aberta **sem leitura há mais de 24 h** (no máximo 5 usinas por varredura; uma consulta por usina por dia; nova tentativa em 1 h se o cadastro não responder).
+
+A falha só é encerrada quando o serial aparece na usina **somente** como Cancelado (3), Bloqueado (4) ou com sufixo `@epoch`, a usina tem ao menos um equipamento ativo **e existe um substituto**: um equipamento Ativo (1) na mesma posição (mesmo `device_name`) com outro serial. Retirado sem substituto (por exemplo, enviado para reparo) mantém a falha aberta. Para inversor em reparo, o procedimento recomendado é marcar como Manutenção (2) no cadastro. Qualquer outra situação (Ativo, Manutenção, não encontrado, cadastro vazio, erro) mantém a falha aberta. O fim registrado é a data do bloqueio (`@epoch`) quando ela é posterior ao início da falha; senão, a última leitura. O incidente vai para o histórico com `encerramento = "SUBSTITUICAO_CADASTRO"`. Não há card no Teams (decisão D1), só log `[SUBSTITUICAO]`.
+
+Chaves no topo do `main.py`:
+
+- `SUBSTITUICAO_VERIFICAR = False` desliga tudo (comportamento anterior ao 4a).
+- `SUBSTITUICAO_ENCERRAR = False` é o modo observação: só registra `[SUBSTITUICAO][OBSERVACAO] Encerraria falha de ...` no log, sem alterar estado. É o valor inicial.
+- `SUBSTITUICAO_MAX_ENCERRAMENTOS_DIA = 3` limita os encerramentos por dia; o excedente fica para o dia seguinte.
+
+O heartbeat das 07:00 (`SUBSTITUICAO_HEARTBEAT_HORARIO`) ganha até três blocos, só quando houver itens: "Cadastro indica substituição (observação, nada foi encerrado)", "Encerradas por substituição no cadastro (últimas 24 h)" e "Retirados no cadastro sem substituto (falha mantida)". Esses blocos ficam em memória: após reinício, voltam a aparecer depois da próxima verificação de cadastro. Os demais horários do heartbeat não mudam.
+
 ---
 
 ## Checklist antes de alterar o monitor
