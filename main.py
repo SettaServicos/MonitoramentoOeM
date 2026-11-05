@@ -119,6 +119,8 @@ WEEKLY_REPORT_GENERATION_TIME = dtime(0, 5)
 # Usa uma semana extra para reconstruir estado na borda da semana sem aumentar
 # demais a carga da API; o state local continua como segunda fonte.
 WEEKLY_REPORT_WARMUP_DAYS = 7
+# Aba "Cobertura" do relatorio: lacunas de comunicacao de rele acima deste limite.
+RELATORIO_LACUNA_MINIMA = timedelta(minutes=45)
 
 RELAY_PARAMS_CLASSIF = {
     "SOBRETENSÃO": {"r59A", "r59B", "r59C", "r59N"},
@@ -1510,6 +1512,34 @@ def _serializar_operacao_monitor(metodo):
     return executar
 
 
+class _APIComRegistroFalhas:
+    """Envolve a API usada pelo relatorio semanal e registra os dias cuja consulta falhou.
+
+    Nao altera dados nem comportamento: repassa cada chamada e apenas anota
+    (endpoint, usina, dia, motivo) quando a resposta nao e utilizavel.
+    """
+
+    def __init__(self, api):
+        self._api = api
+        self.falhas = []
+
+    def get_plants(self):
+        return self._api.get_plants()
+
+    def post_day(self, endpoint, plant_id, date):
+        data_resp, timeout_flag = self._api.post_day(endpoint, plant_id, date)
+        erro_api = bool(getattr(self._api, "last_post_day_error", False))
+        if timeout_flag or erro_api or not isinstance(data_resp, list):
+            motivo = getattr(self._api, "last_post_day_error_reason", None) or (
+                "TIMEOUT" if timeout_flag else "RESPOSTA_INVALIDA"
+            )
+            self.falhas.append((endpoint, str(plant_id), date.date(), str(motivo)))
+        return data_resp, timeout_flag
+
+    def __getattr__(self, nome):
+        return getattr(self._api, nome)
+
+
 # Servico central que orquestra varreduras de reles/inversores e envia notificacoes.
 class MonitorService:
     """Serviço headless: varre relés e inversores e notifica Teams."""
@@ -1536,9 +1566,18 @@ class MonitorService:
         self._plants_cache_ts = None
 
     # Prepara estado inicial do servico e caches de alertas.
-    def __init__(self, api_rele: PVOperationAPI, api_inversor: PVOperationAPI = None):
+    def __init__(self, api_rele: PVOperationAPI, api_inversor: PVOperationAPI = None,
+                 api_relatorio: PVOperationAPI = None):
         self.api_rele = api_rele
         self.api_inversor = api_inversor or api_rele
+        # Conexao dedicada do relatorio semanal: evita disputar sessao/flags de
+        # erro com as varreduras. Sem ela, usa as conexoes das varreduras.
+        self.api_relatorio = api_relatorio
+        self._coleta_apis = None          # (api_rele, api_inversor) da coleta semanal em andamento
+        self._coleta_lacunas = []         # lacunas de comunicacao de rele (aba Cobertura)
+        self._relatorio_gerado = None     # (report_id, arquivo, semana_txt, cobertura) ja escrito
+        self._relatorio_falha_notificada = set()  # (report_id, tipo) de falhas ja avisadas no Teams
+        self._coleta_nomes = {}           # usina_id -> nome, da coleta semanal em andamento
         self._init_state_defaults()
         self.stop_event = threading.Event()
         self._lock_fd = None
@@ -2340,6 +2379,16 @@ class MonitorService:
                 break
         return tipo, _normalizar_parametros_rele(ativos)
 
+    def _api_coleta_rele(self):
+        if self._coleta_apis:
+            return self._coleta_apis[0]
+        return self.api_relatorio or self.api_rele
+
+    def _api_coleta_inversor(self):
+        if self._coleta_apis:
+            return self._coleta_apis[1]
+        return self.api_relatorio or self.api_inversor
+
     def _coletar_incidentes_rele_semana_api(self, usina_id: str, usina_nome: str, inicio_semana: datetime, fim_semana: datetime):
         inicio_busca = inicio_semana - timedelta(days=WEEKLY_REPORT_WARMUP_DAYS)
         fim_busca = fim_semana - timedelta(seconds=1)
@@ -2347,7 +2396,7 @@ class MonitorService:
 
         dia = inicio_busca.date()
         while dia <= fim_busca.date():
-            data_resp, timeout_flag = self.api_rele.post_day("day_relay", int(usina_id), datetime.combine(dia, datetime.min.time()))
+            data_resp, timeout_flag = self._api_coleta_rele().post_day("day_relay", int(usina_id), datetime.combine(dia, datetime.min.time()))
             if timeout_flag:
                 logger_rele.warning(
                     f"Timeout parcial no backfill semanal de rele (usina {usina_id}, dia {dia})."
@@ -2384,6 +2433,8 @@ class MonitorService:
                 identidade = self._identidade_rele_conteudo_relatorio(conteudo)
                 leituras_por_rele[str(rele_id)].append((ts, identidade))
             dia += timedelta(days=1)
+
+        self._registrar_lacunas_rele(usina_id, usina_nome, leituras_por_rele, inicio_semana, fim_semana)
 
         incidentes = []
         for rele_id, itens in leituras_por_rele.items():
@@ -2431,7 +2482,7 @@ class MonitorService:
         fim_busca = fim_semana - timedelta(seconds=1)
         janela_inicio, janela_fim = _obter_janela_solar_inversor(usina_nome)
         falhas, recuperados, _, _, _, _ = detectar_falhas_inversores(
-            self.api_inversor,
+            self._api_coleta_inversor(),
             usina_id,
             inicio_busca,
             fim_busca,
@@ -2485,13 +2536,37 @@ class MonitorService:
             ))
         return incidentes
 
+    def _registrar_lacunas_rele(self, usina_id, usina_nome, leituras_por_rele, inicio_semana, fim_semana):
+        """Lacunas de comunicacao do rele (> RELATORIO_LACUNA_MINIMA) dentro da semana, para a aba Cobertura."""
+        if not leituras_por_rele:
+            self._coleta_lacunas.append((usina_nome, usina_id, "", inicio_semana, fim_semana, "Sem leituras de rele no periodo"))
+            return
+        for rele_id, itens in leituras_por_rele.items():
+            marcas = sorted({ts for ts, _ in itens})
+            anteriores = [ts for ts in marcas if ts < inicio_semana]
+            pontos = ([anteriores[-1]] if anteriores else [inicio_semana]) + [ts for ts in marcas if inicio_semana <= ts < fim_semana]
+            pontos.append(fim_semana)
+            for a, b in zip(pontos, pontos[1:]):
+                ini, fim = max(a, inicio_semana), min(b, fim_semana)
+                if fim - ini > RELATORIO_LACUNA_MINIMA:
+                    if b == fim_semana:
+                        detalhe = "Sem leitura ate o fim da semana"
+                    elif a == inicio_semana and not anteriores:
+                        detalhe = "Sem leitura desde o inicio da semana"
+                    else:
+                        detalhe = "Entre duas leituras"
+                    self._coleta_lacunas.append((usina_nome, usina_id, str(rele_id), ini, fim, detalhe))
+
     def _coletar_incidentes_semana_api(self, inicio_semana: datetime, fim_semana: datetime):
-        plantas = self.api_rele.get_plants()
+        plantas = self._api_coleta_rele().get_plants()
         if plantas is None:
             return None
         if not plantas:
             return []
 
+        self._coleta_nomes = {
+            str(p.get("id")): p.get("nome") for p in plantas if isinstance(p, dict) and p.get("id") is not None
+        }
         incidentes = []
         for p in plantas:
             usina_id_raw = p.get("id")
@@ -2501,14 +2576,15 @@ class MonitorService:
                 continue
             usina_nome = p.get("nome")
             try:
-                incidentes.extend(
-                    self._coletar_incidentes_rele_semana_api(
-                        usina_id=usina_id,
-                        usina_nome=usina_nome,
-                        inicio_semana=inicio_semana,
-                        fim_semana=fim_semana,
+                if usina_id in RELE_PLANT_IDS:
+                    incidentes.extend(
+                        self._coletar_incidentes_rele_semana_api(
+                            usina_id=usina_id,
+                            usina_nome=usina_nome,
+                            inicio_semana=inicio_semana,
+                            fim_semana=fim_semana,
+                        )
                     )
-                )
             except Exception as e:
                 logger_rele.warning(
                     f"Falha no backfill semanal de rele para usina {usina_id}: {e}"
@@ -2763,6 +2839,43 @@ class MonitorService:
 
         return resumo_rows, ocorrencias_rows, semana_txt
 
+    def _montar_aba_cobertura(self, inicio_semana: datetime, fim_semana: datetime, falhas, lacunas, coleta_ok: bool):
+        """Aba "Cobertura": onde faltou dado, para que ausencia de evento nao seja lida como normalidade."""
+        limite_min = int(RELATORIO_LACUNA_MINIMA.total_seconds() // 60)
+        rows = [["Usina", "Usina ID", "Ocorrencia", "Equipamento", "Inicio", "Fim", "Duracao", "Detalhe"]]
+        if not coleta_ok:
+            rows.append([
+                "", "", "COLETA DIRETA DA API INDISPONIVEL", "",
+                self._fmt_ts(inicio_semana), self._fmt_ts(fim_semana), "",
+                "Relatorio gerado apenas com o historico local do monitor",
+            ])
+        for endpoint, usina_id, dia, motivo in sorted(set(falhas), key=lambda x: (x[1], x[2], x[0])):
+            ini = datetime.combine(dia, datetime.min.time())
+            fim = ini + timedelta(days=1)
+            aquecimento = " (dia anterior a semana, usado so para o inicio dos eventos)" if ini < inicio_semana else ""
+            rows.append([
+                self._coleta_nomes.get(usina_id) or f"Usina {usina_id}", usina_id,
+                "FALHA NA CONSULTA A API", endpoint,
+                self._fmt_ts(ini), self._fmt_ts(fim), "", f"{motivo}{aquecimento}",
+            ])
+        for nome, usina_id, rele_id, ini, fim, detalhe in sorted(lacunas, key=lambda x: (str(x[0] or ""), x[3])):
+            rows.append([
+                nome or f"Usina {usina_id}", usina_id,
+                f"LACUNA DE COMUNICACAO DO RELE (> {limite_min} min)", rele_id,
+                self._fmt_ts(ini), self._fmt_ts(fim), _formatar_duracao((fim - ini).total_seconds()), detalhe,
+            ])
+        if len(rows) == 1:
+            rows.append(["", "", "SEM FALHAS DE CONSULTA OU LACUNAS DETECTADAS", "", "", "", "", ""])
+        return rows
+
+    def _avisar_falha_relatorio_uma_vez(self, report_id: str, tipo: str, **card) -> None:
+        """Evita repetir o mesmo aviso no Teams a cada nova tentativa (loop de 5 min)."""
+        chave = (report_id, tipo)
+        if chave in self._relatorio_falha_notificada:
+            return
+        self._relatorio_falha_notificada.add(chave)
+        _teams_post_card(**card)
+
     def _gerar_relatorio_semanal_se_pendente(self, ref: datetime = None):
         agora = ref or datetime.now()
         with self._scan_lock:
@@ -2770,51 +2883,81 @@ class MonitorService:
             if not pendente:
                 return False
             inicio_semana, fim_semana, report_id = pendente
-            incidentes_state = self._coletar_incidentes_semana_state(inicio_semana, fim_semana)
+            gerado = self._relatorio_gerado
+            reaproveitar = bool(gerado and gerado[0] == report_id and Path(gerado[1]).is_file())
+            incidentes_state = None if reaproveitar else self._coletar_incidentes_semana_state(inicio_semana, fim_semana)
 
-        # Coleta da API fora do lock para não bloquear scans e heartbeat.
-        _t0_rel_api = time.monotonic()
-        incidentes_api = self._coletar_incidentes_semana_api(inicio_semana, fim_semana)
-        logger.info("[RELATORIO] Coleta API semanal concluida em %.1fs", time.monotonic() - _t0_rel_api)
-
-        if incidentes_api is None:
-            incidentes_finais = self._mesclar_incidentes_relatorio(incidentes_state, fim_semana)
-            logger.warning(
-                "Relatorio semanal usando apenas state local (coleta direta da API indisponivel)."
-            )
+        if reaproveitar:
+            # O arquivo desta semana ja foi gerado e so o envio falhou: reenviar
+            # sem refazer a coleta da API (que custa milhares de chamadas).
+            arquivo, semana_txt = gerado[1], gerado[2]
+            logger.info("[RELATORIO] Reenviando relatorio ja gerado, sem nova coleta: %s", arquivo)
         else:
-            incidentes_finais = self._mesclar_incidentes_relatorio(
-                list(incidentes_api) + list(incidentes_state), fim_semana
+            # Coleta da API fora do lock para não bloquear scans e heartbeat.
+            api_rele_coleta = _APIComRegistroFalhas(self.api_relatorio or self.api_rele)
+            base_inv = self.api_relatorio or self.api_inversor
+            api_inv_coleta = (
+                api_rele_coleta if base_inv is (self.api_relatorio or self.api_rele)
+                else _APIComRegistroFalhas(base_inv)
             )
-            logger.info(
-                "[RELATORIO] Incidentes semanais consolidados | API: %s | State: %s | Final: %s",
-                len(incidentes_api),
-                len(incidentes_state),
-                len(incidentes_finais),
-            )
+            self._coleta_apis = (api_rele_coleta, api_inv_coleta)
+            self._coleta_lacunas = []
+            self._coleta_nomes = {}
+            _t0_rel_api = time.monotonic()
+            try:
+                incidentes_api = self._coletar_incidentes_semana_api(inicio_semana, fim_semana)
+            finally:
+                self._coleta_apis = None
+            logger.info("[RELATORIO] Coleta API semanal concluida em %.1fs", time.monotonic() - _t0_rel_api)
+            falhas_coleta = list(api_rele_coleta.falhas)
+            if api_inv_coleta is not api_rele_coleta:
+                falhas_coleta.extend(api_inv_coleta.falhas)
+            lacunas_coleta = list(self._coleta_lacunas)
 
-        resumo_rows, ocorrencias_rows, semana_txt = self._montar_relatorio_semanal(
-            inicio_semana, fim_semana, incidentes_finais, {}, {}
-        )
-        fim_legivel = (fim_semana - timedelta(days=1)).strftime("%Y%m%d")
-        arquivo = REPORT_DIR / f"relatorio_semanal_{inicio_semana.strftime('%Y%m%d')}_{fim_legivel}.xlsx"
-        try:
-            _write_xlsx_file(
-                arquivo,
-                [
-                    ("Resumo", resumo_rows),
-                    ("Ocorrencias", ocorrencias_rows),
-                ],
+            if incidentes_api is None:
+                incidentes_finais = self._mesclar_incidentes_relatorio(incidentes_state, fim_semana)
+                logger.warning(
+                    "Relatorio semanal usando apenas state local (coleta direta da API indisponivel)."
+                )
+            else:
+                incidentes_finais = self._mesclar_incidentes_relatorio(
+                    list(incidentes_api) + list(incidentes_state), fim_semana
+                )
+                logger.info(
+                    "[RELATORIO] Incidentes semanais consolidados | API: %s | State: %s | Final: %s",
+                    len(incidentes_api),
+                    len(incidentes_state),
+                    len(incidentes_finais),
+                )
+
+            resumo_rows, ocorrencias_rows, semana_txt = self._montar_relatorio_semanal(
+                inicio_semana, fim_semana, incidentes_finais, {}, {}
             )
-        except Exception as e:
-            logger.error(f"[RELATORIO] Falha ao escrever arquivo xlsx: {e}")
-            _teams_post_card(
-                title="Monitor: falha ao gerar relatório semanal",
-                text=f"Erro ao escrever arquivo: {e}",
-                severity="warning",
-                facts=[("Arquivo", str(arquivo))],
+            cobertura_rows = self._montar_aba_cobertura(
+                inicio_semana, fim_semana, falhas_coleta, lacunas_coleta, incidentes_api is not None
             )
-            return False
+            fim_legivel = (fim_semana - timedelta(days=1)).strftime("%Y%m%d")
+            arquivo = REPORT_DIR / f"relatorio_semanal_{inicio_semana.strftime('%Y%m%d')}_{fim_legivel}.xlsx"
+            try:
+                _write_xlsx_file(
+                    arquivo,
+                    [
+                        ("Resumo", resumo_rows),
+                        ("Ocorrencias", ocorrencias_rows),
+                        ("Cobertura", cobertura_rows),
+                    ],
+                )
+            except Exception as e:
+                logger.error(f"[RELATORIO] Falha ao escrever arquivo xlsx: {e}")
+                self._avisar_falha_relatorio_uma_vez(
+                    report_id, "xlsx",
+                    title="Monitor: falha ao gerar relatório semanal",
+                    text=f"Erro ao escrever arquivo: {e}",
+                    severity="warning",
+                    facts=[("Arquivo", str(arquivo))],
+                )
+                return False
+            self._relatorio_gerado = (report_id, arquivo, semana_txt)
 
         try:
             status_email = _get_outlook_service().send_weekly_report(arquivo, semana_txt)
@@ -2826,7 +2969,8 @@ class MonitorService:
             )
         except Exception as e:
             logger.exception("[RELATORIO] Falha ao enviar email do relatorio semanal")
-            _teams_post_card(
+            self._avisar_falha_relatorio_uma_vez(
+                report_id, "email",
                 title="Monitor: falha ao enviar relatório semanal por e-mail",
                 text=(
                     "O arquivo XLSX foi gerado, mas o envio pelo Outlook falhou. "
@@ -2842,6 +2986,7 @@ class MonitorService:
             return False
 
         with self._scan_lock:
+            self._relatorio_gerado = None
             if self.last_weekly_report_id == report_id:
                 return True
             self.last_weekly_report_id = report_id
@@ -3782,7 +3927,8 @@ def main():
     validate_config()
     api_rele = PVOperationAPI(email=PVOP_EMAIL, password=PVOP_PASSWORD, base_url=PVOP_BASE_URL)
     api_inv = PVOperationAPI(email=PVOP_EMAIL, password=PVOP_PASSWORD, base_url=PVOP_BASE_URL)
-    service = MonitorService(api_rele, api_inv)
+    api_rel = PVOperationAPI(email=PVOP_EMAIL, password=PVOP_PASSWORD, base_url=PVOP_BASE_URL)
+    service = MonitorService(api_rele, api_inv, api_rel)
 
     def _handle_exit(signum=None, frame=None):
         logger.info("Encerrando monitor...")

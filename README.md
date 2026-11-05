@@ -248,10 +248,11 @@ O fluxo de `main()` é:
 1. `validate_config()`.
 2. Cria um `PVOperationAPI` para relés.
 3. Cria outro `PVOperationAPI` para inversores.
-4. Cria `MonitorService(api_rele, api_inv)`.
-5. Registra handlers para `SIGINT` e `SIGTERM`.
-6. Chama `service.start()`.
-7. Mantém o processo vivo em loop com `time.sleep(1)`.
+4. Cria um terceiro `PVOperationAPI`, exclusivo do relatório semanal, para que a coleta semanal não dispute sessão nem flags de erro com as varreduras.
+5. Cria `MonitorService(api_rele, api_inv, api_rel)`.
+6. Registra handlers para `SIGINT` e `SIGTERM`.
+7. Chama `service.start()`.
+8. Mantém o processo vivo em loop com `time.sleep(1)`.
 
 O `service.start()` faz:
 
@@ -1048,6 +1049,7 @@ Para reduzir erro na borda da semana, a coleta direta da API busca a semana repo
 
 Relés:
 
+- consulta somente as usinas de `RELE_PLANT_IDS` (as demais não têm relé);
 - reconstrói incidentes por relé a partir das mudanças de identidade ativa;
 - separa eventos de mesmo tipo com parâmetros diferentes.
 
@@ -1078,6 +1080,13 @@ Abas:
 |---|---|
 | `Resumo` | Agregado por semana, usina, natureza e tipo de falha. |
 | `Ocorrencias` | Lista detalhada de cada ocorrência, equipamento e duração. |
+| `Cobertura` | Onde faltou dado na coleta: dias em que a consulta à API falhou (por usina e endpoint) e lacunas de comunicação do relé maiores que 45 minutos (`RELATORIO_LACUNA_MINIMA`). Serve para que ausência de evento não seja lida como normalidade. Se não houver nada, informa explicitamente. |
+
+As abas `Resumo` e `Ocorrencias` mantêm exatamente as mesmas colunas; `Cobertura` é acrescentada ao final.
+
+### Reenvio quando o e-mail falha
+
+Se o arquivo foi gerado e só o envio pelo Outlook falhou, as tentativas seguintes (a cada 5 minutos) reenviam o mesmo arquivo, sem refazer a coleta da API. O aviso de falha no Teams (e-mail ou gravação do XLSX) é enviado uma única vez por semana de relatório. O reaproveitamento fica em memória: se o processo reiniciar antes do envio, a coleta é refeita uma vez.
 
 ### Métricas de indisponibilidade
 
@@ -1194,13 +1203,13 @@ python -m pytest -q
 Coleta atual:
 
 ```txt
-253 tests collected
+259 tests collected
 ```
 
 Na última execução local nesta estação:
 
 ```txt
-253 passed in 0.93s
+259 passed
 ```
 
 Arquivos:
@@ -1327,4 +1336,4 @@ python -m pytest -q
 | Lock | `state/.monitor_lock`. |
 | Logs de relé | `logs/rele/rele.log`. |
 | Logs de inversor | `logs/inversor/inversor.log`. |
-| Testes | 253 casos coletados pelo pytest. |
+| Testes | 259 casos coletados pelo pytest. |

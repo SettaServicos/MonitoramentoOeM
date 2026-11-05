@@ -688,7 +688,9 @@ class FakeWeeklyApi:
         return [], False
 
 
-def test_coleta_semana_api_inclui_relay_normalizado():
+def test_coleta_semana_api_inclui_relay_normalizado(monkeypatch):
+    # A coleta semanal de rele so consulta usinas com rele (RELE_PLANT_IDS).
+    monkeypatch.setattr(main, "RELE_PLANT_IDS", {"1"})
     api = FakeWeeklyApi()
     service = main.MonitorService(api, api)
 
